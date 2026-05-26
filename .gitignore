@@ -1,0 +1,11 @@
+.cache/
+.vscode/
+.home/*
+!.home/README.md
+outputs/
+
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
