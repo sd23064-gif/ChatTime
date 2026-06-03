@@ -29,7 +29,7 @@ def chronological_split(df, train_ratio=0.6, val_ratio=0.2):
 
 def main():
     dataset_path = "./dataset/ETTh2.csv"
-    model_path = "./outputs/models/ChatTime-Mamba-Chat"
+    model_path = "ChengsenWang/ChatTime-1-7B-Chat"
 
     dataset_name = "ETTh2"
     pred_len = 24
@@ -71,7 +71,7 @@ def main():
     results = []
 
     selected_columns = value_df_std.columns.tolist()
-    max_eval_windows = 5
+    max_eval_windows = 50
 
     # =========================
     # 3. Zero-shot forecasting
@@ -165,7 +165,7 @@ def main():
         )
     )
 
-    summary_col_path = "outputs/chattime_mamba_etth2_mae_summary_by_column.csv"
+    summary_col_path = "outputs/chattime_etth2_mae_summary_by_column.csv"
     summary_col_df.to_csv(summary_col_path, index=False)
 
     print("\nPaper-like Summary")
