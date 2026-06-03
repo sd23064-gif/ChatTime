@@ -48,17 +48,29 @@ class Serializer:
         return serialized_context
 
     def inverse_serialize(self, serialized_context):
-        pattern = rf"{self.time_flag}(.*?){self.time_flag}"
+        flag = re.escape(self.time_flag)
+        pattern = rf"{flag}(.*?){flag}"
         matches = re.findall(pattern, serialized_context)
 
         context = []
+
         for num in matches:
+            num = str(num).strip()
+
+            # 空白だけ、空文字の場合
+            if num == "":
+                context.append(np.nan)
+                continue
+
+            # Nan / NaN / nan の場合
+            if num.lower() == self.nan_flag.lower():
+                context.append(np.nan)
+                continue
+
             try:
                 context.append(float(num))
-            except ValueError as e:
-                print(e)
-                context.append(np.NaN)
+            except ValueError:
+                # 数値に変換できないものはNaNとして扱う
+                context.append(np.nan)
 
-        context = np.array(context)
-
-        return context
+        return np.array(context, dtype=np.float64)
