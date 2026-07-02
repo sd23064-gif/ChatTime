@@ -4,16 +4,17 @@ import sys
 import numpy as np
 import torch
 from datasets import load_dataset
-from transformers import TrainingArguments, AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+# 【変更前】
+# from transformers import TrainingArguments, LlamaTokenizer
+# 【変更後】
+from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments
+from peft import LoraConfig, get_peft_model
 from trl import SFTTrainer
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-import wandb
 
 def is_bfloat16_supported():
     return torch.cuda.is_available() and torch.cuda.is_bf16_supported()
 
 if __name__ == "__main__":
-    print("bf16 supported:", is_bfloat16_supported())
     parser = argparse.ArgumentParser()
     parser.add_argument("--code_path", type=str, required=True, default=None)
     parser.add_argument("--model_path", type=str, required=True, default=None)
@@ -45,76 +46,61 @@ if __name__ == "__main__":
     parser.add_argument("--nan_flag", type=str, default="Nan")
 
     parser.add_argument("--wandb_run_name", type=str, default=None)
-
-        
-    parser.add_argument("--learning_rate", type=float, default=1e-5)
-    parser.add_argument("--max_grad_norm", type=float, default=0.3)
-    parser.add_argument("--optim", type=str, default="adamw_torch")
-    parser.add_argument("--single_gpu", action="store_true", default=False)
-
-
     args = parser.parse_args()
 
-    
+    sys.path.append(args.code_path)
+    from utils.tools import Discretizer, Serializer
+
     if args.wandb_run_name is None:
         args.wandb_run_name = (
             f"mamba-{args.model_path.split('/')[-1]}"
             f"-bs{args.per_device_train_batch_size}"
             f"-ga{args.gradient_accumulation_steps}"
         )
-
-
-    sys.path.append(args.code_path)
-    from utils.tools import Discretizer, Serializer
-    device_map = {"": 0} if args.single_gpu else "auto"
     # construct vocabulary
+    
+    # 【変更前】
+    # tokenizer = LlamaTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    # tokenizer.pad_token = tokenizer.eos_token
+    # tokenizer.padding_side = "right"
+
+    # 【変更後】
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+
     discretizer = Discretizer(low_limit=args.low_limit, high_limit=args.high_limit, n_tokens=args.n_tokens)
     serializer = Serializer(prec=args.prec, time_sep=args.time_sep, time_flag=args.time_flag, nan_flag=args.nan_flag)
 
-    vocabulary = np.concatenate((discretizer.centers[1:-1], [np.NaN])).reshape(-1, 1)
+    vocabulary = np.concatenate((discretizer.centers[1:-1], [np.nan])).reshape(-1, 1)
     vocabulary = np.array([serializer.serialize(i) for i in vocabulary])
     print(f"\nVocabulary: \n{vocabulary}\n")
 
-
-    # add token to llama tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
-    tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
-    print(f"Old model pieces: {len(tokenizer.get_vocab())}")
-    tokenizer.add_tokens(vocabulary.tolist())
-    print(f"New model pieces: {len(tokenizer.get_vocab())}")
+    num_added_tokens = tokenizer.add_tokens(vocabulary.tolist())
+    
+    print(f"Added tokens: {num_added_tokens}")
+    print(f"New tokenizer size: {len(tokenizer)}")
 
     EOS_TOKEN = tokenizer.eos_token
 
-    # quantization config
-    
-    quantization_config = None
-    if args.load_in_4bit:
-        quantization_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16 if is_bfloat16_supported() else torch.float16,
-            bnb_4bit_use_double_quant=True,
-        )
 
+    # load model
+    
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
-        torch_dtype=torch.float32,
-        device_map=device_map,
+        torch_dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16,
+        device_map="auto",
         trust_remote_code=True,
-        quantization_config=quantization_config,
     )
 
+
+    # add lora to llama model
+    # 【変更前】 target_modules=["q_proj", "k_proj", ...], modules_to_save=["embed_tokens", "lm_head"]
     model.resize_token_embeddings(len(tokenizer))
-    model.config.pad_token_id = tokenizer.pad_token_id
-    model.config.use_cache = False
-    
+    # 【変更後】
 
-    if args.load_in_4bit:
-        model = prepare_model_for_kbit_training(model)
-
-    
-    peft_config = LoraConfig(
+    lora_config = LoraConfig(
         r=args.lora_rank,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
@@ -123,19 +109,17 @@ if __name__ == "__main__":
         target_modules=[
             "x_proj",
             "in_proj",
-            "out_proj",
             "dt_proj"
+            "out_proj",
         ],
         modules_to_save=[
-            "embeddings",
+            "backbone.embeddings",
+            "lm_head",
         ],
     )
 
-
-    model = get_peft_model(model, peft_config)
+    model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
-
-
 
 
     # load dataset
@@ -144,29 +128,13 @@ if __name__ == "__main__":
 
 
     print(f"\nLoading dataset in {args.dataset_path}")
-
-    if args.dataset_path.endswith(".jsonl") or args.dataset_path.endswith(".json"):
-        dataset = load_dataset("json", data_files=args.dataset_path, split="train")
-    elif args.dataset_path.endswith(".csv"):
-        dataset = load_dataset("csv", data_files=args.dataset_path, split="train")
-    else:
-        dataset = load_dataset(
+    dataset = load_dataset(
             "csv",
             data_files=f"https://huggingface.co/datasets/{args.dataset_path}/resolve/main/ChatTime-1-Pretrain-1M.csv",
             split="train",
         )
 
-    print(dataset)
-    print("Column names:", dataset.column_names)
-    print("First example:", dataset[0])
-    
-    sample_tokens = dataset[0]["text"].split()[:5000]
-    vocab = tokenizer.get_vocab()
-
-    missing_tokens = [tok for tok in sample_tokens if tok not in vocab]
-
-    print("missing token count:", len(missing_tokens))
-    print("first missing tokens:", missing_tokens[:20])
+    print(f"Dataset example: \n{dataset[0]['text']}\n")
 
     # train model
     trainer = SFTTrainer(
@@ -179,14 +147,13 @@ if __name__ == "__main__":
         packing=False,
         formatting_func=formatting_func,
         args=TrainingArguments(
-            logging_nan_inf_filter=False,
             per_device_train_batch_size=args.per_device_train_batch_size,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             num_train_epochs=args.num_train_epochs,
             weight_decay=0.01,
             warmup_ratio=0.05,
-            max_grad_norm=args.max_grad_norm,
-            learning_rate=args.learning_rate,
+            max_grad_norm=1.0,
+            learning_rate=2e-4,
             logging_strategy="steps",
             logging_steps=args.logging_steps,
             save_strategy="steps",
@@ -194,16 +161,15 @@ if __name__ == "__main__":
             max_steps=args.max_steps,
             save_total_limit=1,
             logging_first_step=True,
-            optim=args.optim,
+            optim="adamw_8bit",
             lr_scheduler_type="cosine",
             seed=args.random_seed,
             output_dir=args.log_path,
-            fp16=False,
-            bf16=False,
-            
+            fp16=not is_bfloat16_supported(),
+            bf16=is_bfloat16_supported(),
+
             report_to="wandb",
             run_name=args.wandb_run_name,
-
         ),
     )
 
@@ -229,5 +195,9 @@ if __name__ == "__main__":
     print(f"Peak reserved memory for training % of max memory = {lora_percentage} %.\n")
 
     # save model and tokenizer
+    print(f"Saving LoRA adapter to {args.output_path}")
+
     model.save_pretrained(args.output_path)
     tokenizer.save_pretrained(args.output_path)
+
+    print("Save completed")
