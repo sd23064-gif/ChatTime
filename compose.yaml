@@ -20,11 +20,20 @@ services:
       - HF_HOME=/workspace/.cache/huggingface     # DLしたモデルのキャッシュ先．これがないと毎回DLすることになり時間の無駄．
       - HF_TOKEN=${HF_TOKEN}
       - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
+      - TRITON_CACHE_DIR=/workspace/.cache/triton
       - WANDB_PROJECT=${COMPOSE_PROJECT_NAME}
       - WANDB_DIR=/workspace/.cache/wandb
+      - WANDB_CACHE_DIR=/workspace/.cache/wandb
+      - WANDB_CONFIG_DIR=/workspace/.cache/wandb
       - WANDB_API_KEY=${WANDB_API_KEY}
+      - WANDB_DATA_DIR=/workspace/.cache/wandb/data
+      - WANDB_LOG_MODEL=false
       - MPLCONFIGDIR=/workspace/.cache/matplotlib
-      
+
+      - UNSLOTH_COMPILE_DISABLE=1
+      - TORCHINDUCTOR_FX_GRAPH_CACHE=0
+      - TORCHINDUCTOR_AUTOGRAD_CACHE=0
+
     # コンテナ内でGPUを使用可能にする．
     deploy:
       resources:
