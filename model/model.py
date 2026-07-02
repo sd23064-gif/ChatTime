@@ -122,3 +122,4 @@ class ChatTime:
         response = mode(response_list)
 
         return response
+
