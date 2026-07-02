@@ -58,3 +58,4 @@ output/
 data/
 *.tsv
 *.csv
+results/
