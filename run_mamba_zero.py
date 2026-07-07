@@ -4,12 +4,36 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 import torch
-
+import argparse
+import json
 from model.model import ChatTime
 from model.mamba_model import ChatTimeMamba
 
 np.NaN = np.nan
 
+def rmse(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=np.float64)
+    y_pred = np.asarray(y_pred, dtype=np.float64)
+
+    mask = ~np.isnan(y_true) & ~np.isnan(y_pred)
+
+    if mask.sum() == 0:
+        return np.nan
+
+    return np.sqrt(np.mean((y_true[mask] - y_pred[mask]) ** 2))
+
+
+def smape(y_true, y_pred, eps=1e-8):
+    y_true = np.asarray(y_true, dtype=np.float64)
+    y_pred = np.asarray(y_pred, dtype=np.float64)
+
+    mask = ~np.isnan(y_true) & ~np.isnan(y_pred)
+
+    if mask.sum() == 0:
+        return np.nan
+
+    denom = np.abs(y_true[mask]) + np.abs(y_pred[mask]) + eps
+    return np.mean(2.0 * np.abs(y_pred[mask] - y_true[mask]) / denom)
 
 def mae(y_true, y_pred):
     y_true = np.asarray(y_true, dtype=np.float64)
@@ -90,14 +114,51 @@ def cleanup_model(model):
 
 
 def main():
-    dataset_path = "./dataset/ETTh2.csv"
-    dataset_name = "ETTh2"
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="outputs/mamba_2.8b_analyze",
+        help="評価結果を保存するディレクトリ",
+    )
+
+    parser.add_argument(
+        "--dataset_path",
+        type=str,
+        default="./dataset/ETTh2.csv",
+        help="評価に使うCSVデータセット",
+    )
+
+    parser.add_argument(
+        "--dataset_name",
+        type=str,
+        default="ETTh2",
+        help="結果ファイルに記録するデータセット名",
+    )
+
+    parser.add_argument(
+        "--max_eval_windows",
+        type=int,
+        default=10,
+        help="各系列ごとに評価する最大window数。-1なら全window",
+    )
+
+    args = parser.parse_args()
+
+    output_dir = args.output_dir
+    os.makedirs(output_dir, exist_ok=True)
+
+    dataset_path = args.dataset_path
+    dataset_name = args.dataset_name
 
     pred_len = 24
     hist_lengths = [48, 72]
-    max_eval_windows = 10
 
-    os.makedirs("outputs", exist_ok=True)
+    max_eval_windows = args.max_eval_windows
+    if max_eval_windows < 0:
+        max_eval_windows = None
+
 
     # =========================
     # Model configs
@@ -113,17 +174,17 @@ def main():
             "model_path": "ChengsenWang/ChatTime-1-7B-Chat",
         },
         {
-            "name": "mamba_base",
+            "name": "mamba_pretrain_2.8b",
             "type": "mamba",
-            "base_model_path": "state-spaces/mamba-370m-hf",
-            "adapter_path": None,
+            "base_model_path": "state-spaces/mamba-2.8b-hf",
+            "adapter_path": "outputs/model/mamba-2.8b-time",
             "num_samples": 8,
         },
         {
-            "name": "mamba_finetuned",
+            "name": "mamba_finetuned_2.8b",
             "type": "mamba",
-            "base_model_path": "state-spaces/mamba-370m-hf",
-            "adapter_path": "./outputs/model/finetune-mamba-320m",
+            "base_model_path": "state-spaces/mamba-2.8b-hf",
+            "adapter_path": "outputs/model/finetune-mamba-2.8b-time-finetune",
             "num_samples": 8,
         },
     ]
@@ -224,9 +285,18 @@ def main():
                             )
                             continue
 
-                        score = mae(true_data, pred_data)
+                        mae_std = mae(true_data, pred_data)
+                        rmse_std = rmse(true_data, pred_data)
+                        smape_std = smape(true_data, pred_data)
 
-                        if np.isnan(score):
+                        pred_raw = pred_data * std[col] + mean[col]
+                        true_raw = true_data * std[col] + mean[col]
+
+                        mae_raw = mae(true_raw, pred_raw)
+                        rmse_raw = rmse(true_raw, pred_raw)
+                        smape_raw = smape(true_raw, pred_raw)
+
+                        if np.isnan(mae_std):
                             continue
 
                         all_results.append({
@@ -236,9 +306,15 @@ def main():
                             "hist_len": hist_len,
                             "pred_len": pred_len,
                             "start_index": start,
-                            "mae": score,
-                        })
 
+                            "mae_std": mae_std,
+                            "rmse_std": rmse_std,
+                            "smape_std": smape_std,
+
+                            "mae_raw": mae_raw,
+                            "rmse_raw": rmse_raw,
+                            "smape_raw": smape_raw,
+                        })
                     except Exception as e:
                         print(
                             f"Prediction failed: model={model_name}, col={col}, "
@@ -271,13 +347,21 @@ def main():
         result_df
         .groupby(["dataset", "model", "hist_len", "pred_len"], as_index=False)
         .agg(
-            mae_mean=("mae", "mean"),
-            mae_std=("mae", "std"),
-            n_samples=("mae", "count"),
+            mae_std_mean=("mae_std", "mean"),
+            mae_std_std=("mae_std", "std"),
+            rmse_std_mean=("rmse_std", "mean"),
+            smape_std_mean=("smape_std", "mean"),
+
+            mae_raw_mean=("mae_raw", "mean"),
+            mae_raw_std=("mae_raw", "std"),
+            rmse_raw_mean=("rmse_raw", "mean"),
+            smape_raw_mean=("smape_raw", "mean"),
+
+            n_samples=("mae_std", "count"),
         )
     )
 
-    summary_path = "outputs/model_comparison_etth2_mae_summary.csv"
+    summary_path = "outputs/mamba_2.8b_analyze/model_comparison_etth2_mae_summary.csv"
     summary_df.to_csv(summary_path, index=False)
 
     # =========================
@@ -287,13 +371,21 @@ def main():
         result_df
         .groupby(["dataset", "model", "column", "hist_len", "pred_len"], as_index=False)
         .agg(
-            mae_mean=("mae", "mean"),
-            mae_std=("mae", "std"),
-            n_samples=("mae", "count"),
+            mae_std_mean=("mae_std", "mean"),
+            mae_std_std=("mae_std", "std"),
+            rmse_std_mean=("rmse_std", "mean"),
+            smape_std_mean=("smape_std", "mean"),
+
+            mae_raw_mean=("mae_raw", "mean"),
+            mae_raw_std=("mae_raw", "std"),
+            rmse_raw_mean=("rmse_raw", "mean"),
+            smape_raw_mean=("smape_raw", "mean"),
+
+            n_samples=("mae_std", "count"),
         )
     )
 
-    summary_col_path = "outputs/model_comparison_etth2_mae_summary_by_column.csv"
+    summary_col_path = "outputs/mamba_2.8b_analyze/model_comparison_etth2_mae_summary_by_column.csv"
     summary_col_df.to_csv(summary_col_path, index=False)
 
     # =========================
@@ -303,17 +395,47 @@ def main():
         result_df
         .groupby(["dataset", "model"], as_index=False)
         .agg(
-            mae_mean=("mae", "mean"),
-            mae_std=("mae", "std"),
-            n_samples=("mae", "count"),
-        )
-        .sort_values("mae_mean")
-    )
+            mae_std_mean=("mae_std", "mean"),
+            mae_std_std=("mae_std", "std"),
+            rmse_std_mean=("rmse_std", "mean"),
+            smape_std_mean=("smape_std", "mean"),
 
+            mae_raw_mean=("mae_raw", "mean"),
+            mae_raw_std=("mae_raw", "std"),
+
+            n_samples=("mae_std", "count"),
+        )
+        .sort_values("mae_std_mean")
+    )
+    baseline_name = "mamba_normal_finetuned"
+
+    if baseline_name in ranking_df["model"].values:
+        baseline_mae = ranking_df.loc[
+            ranking_df["model"] == baseline_name,
+            "mae_std_mean"
+        ].iloc[0]
+
+        ranking_df["mae_std_improvement_vs_normal_mamba_pct"] = (
+            (baseline_mae - ranking_df["mae_std_mean"]) / baseline_mae * 100.0
+        )
+    else:
+        ranking_df["mae_std_improvement_vs_normal_mamba_pct"] = np.nan
     ranking_path = "outputs/model_comparison_etth2_mae_ranking.csv"
     ranking_df.to_csv(ranking_path, index=False)
+    import json
 
-    print("\nSummary")
+    eval_config = {
+        "dataset_path": dataset_path,
+        "dataset_name": dataset_name,
+        "pred_len": pred_len,
+        "hist_lengths": hist_lengths,
+        "max_eval_windows": max_eval_windows,
+        "models": model_configs,
+    }
+
+    with open("outputs/model_comparison_etth2_eval_config.json", "w", encoding="utf-8") as f:
+        json.dump(eval_config, f, ensure_ascii=False, indent=2)
+        print("\nSummary")
     print(summary_df)
 
     print("\nRanking")

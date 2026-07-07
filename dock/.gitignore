@@ -1,0 +1,61 @@
+# Python系
+__pycache__/
+__init__.py
+*.py[codz]
+*$py.class
+.cache/
+.vscode/
+.home/*
+!.home/README.md
+outputs/
+dataset/
+
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+#pakcging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Environments
+.env
+.envrc
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# WandB (ログフォルダ)
+wandb/
+
+# データや出力ファイル (これらはGitに入れずローカルで管理するのが一般的)
+output/
+data/
+*.tsv
+*.csv
+results/

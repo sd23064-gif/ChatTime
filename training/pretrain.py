@@ -1,11 +1,15 @@
 import argparse
 import sys
 
+import os
+
+os.environ["UNSLOTH_RETURN_LOGITS"] = "1"
+
 import numpy as np
 import torch
 from datasets import load_dataset
-from transformers import TrainingArguments, LlamaTokenizer
-from trl import SFTTrainer
+from transformers import AutoTokenizer
+from trl import SFTTrainer, SFTConfig
 from unsloth import FastLanguageModel, is_bfloat16_supported
 
 if __name__ == "__main__":
@@ -39,6 +43,13 @@ if __name__ == "__main__":
     parser.add_argument("--time_flag", type=str, default="###")
     parser.add_argument("--nan_flag", type=str, default="Nan")
 
+    parser.add_argument("--learning_rate", type=float, default=2e-4)
+    parser.add_argument("--dataset_file", type=str, default=None)
+
+
+    parser.add_argument("--wandb_project", type=str, default="chattime-pretrain")
+    parser.add_argument("--wandb_run_name", type=str, default=None)
+
     args = parser.parse_args()
 
     sys.path.append(args.code_path)
@@ -48,17 +59,28 @@ if __name__ == "__main__":
     discretizer = Discretizer(low_limit=args.low_limit, high_limit=args.high_limit, n_tokens=args.n_tokens)
     serializer = Serializer(prec=args.prec, time_sep=args.time_sep, time_flag=args.time_flag, nan_flag=args.nan_flag)
 
-    vocabulary = np.concatenate((discretizer.centers[1:-1], [np.NaN])).reshape(-1, 1)
+    vocabulary = np.concatenate((discretizer.centers[1:-1], [np.nan])).reshape(-1, 1)
     vocabulary = np.array([serializer.serialize(i) for i in vocabulary])
     print(f"\nVocabulary: \n{vocabulary}\n")
 
-    # add token to llama tokenizer
-    tokenizer = LlamaTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
-    tokenizer.pad_token = tokenizer.eos_token
+
+    # add token to tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_path,
+        trust_remote_code=True,
+        use_fast=True,
+    )
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
     tokenizer.padding_side = "right"
+
     print(f"Old model pieces: {len(tokenizer.get_vocab())}")
-    tokenizer.add_tokens(vocabulary.tolist())
+    num_added_tokens = tokenizer.add_tokens(vocabulary.tolist())
+    print(f"Added tokens: {num_added_tokens}")
     print(f"New model pieces: {len(tokenizer.get_vocab())}")
+
 
     EOS_TOKEN = tokenizer.eos_token
 
@@ -86,47 +108,70 @@ if __name__ == "__main__":
     )
 
 
-    # load dataset
-    def formatting_func(example):
-        return example["text"] + EOS_TOKEN
-
-
     print(f"\nLoading dataset in {args.dataset_path}")
-    dataset = load_dataset(args.dataset_path, split="train")
-    print(f"Dataset example: \n{dataset[0]['text']}\n")
 
+    if args.dataset_file is not None:
+        data_files = args.dataset_file
+    else:
+        data_files = f"https://huggingface.co/datasets/{args.dataset_path}/resolve/main/ChatTime-1-Pretrain-1M.csv"
+
+    dataset = load_dataset(
+        "csv",
+        data_files=data_files,
+        split="train",
+    )
+    print(f"Dataset example: \n{dataset[0]['text']}\n")
+    dataset = dataset.map(
+    lambda x: {"text": x["text"] + EOS_TOKEN},
+    )
     # train model
+    training_args = SFTConfig(
+        output_dir=args.log_path,
+
+        per_device_train_batch_size=args.per_device_train_batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        num_train_epochs=args.num_train_epochs,
+        max_steps=args.max_steps,
+
+        weight_decay=0.01,
+        warmup_steps=0,
+        max_grad_norm=1.0,
+        learning_rate=args.learning_rate,
+
+        logging_strategy="steps",
+        logging_steps=args.logging_steps,
+        save_strategy="steps",
+        save_steps=args.save_steps,
+        save_total_limit=1,
+        logging_first_step=True,
+
+        optim="adamw_8bit",
+        lr_scheduler_type="cosine",
+        seed=args.random_seed,
+
+        fp16=not is_bfloat16_supported(),
+        bf16=is_bfloat16_supported(),
+
+        dataset_text_field="text",
+        max_length=args.max_seq_length,
+        packing=False,
+
+        # まずは1推奨。動作確認後に4, 8などへ上げる
+        dataset_num_proc=1,
+
+        torch_compile=False,
+
+        
+        report_to="wandb",
+        run_name=args.wandb_run_name,
+
+    )
+
     trainer = SFTTrainer(
         model=model,
-        tokenizer=tokenizer,
+        args=training_args,
         train_dataset=dataset,
-        dataset_text_field="text",
-        max_seq_length=args.max_seq_length,
-        dataset_num_proc=64,
-        packing=False,
-        formatting_func=formatting_func,
-        args=TrainingArguments(
-            per_device_train_batch_size=args.per_device_train_batch_size,
-            gradient_accumulation_steps=args.gradient_accumulation_steps,
-            num_train_epochs=args.num_train_epochs,
-            weight_decay=0.01,
-            warmup_ratio=0.05,
-            max_grad_norm=1.0,
-            learning_rate=2e-4,
-            logging_strategy="steps",
-            logging_steps=args.logging_steps,
-            save_strategy="steps",
-            save_steps=args.save_steps,
-            max_steps=args.max_steps,
-            save_total_limit=1,
-            logging_first_step=True,
-            optim="adamw_8bit",
-            lr_scheduler_type="cosine",
-            seed=args.random_seed,
-            output_dir=args.log_path,
-            fp16=not is_bfloat16_supported(),
-            bf16=is_bfloat16_supported(),
-        ),
+        processing_class=tokenizer,
     )
 
     # title Show current memory stats

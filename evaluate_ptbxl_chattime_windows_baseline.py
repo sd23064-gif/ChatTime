@@ -373,7 +373,16 @@ def main():
                 # Baselines
                 baseline_preds = make_baseline_predictions(hist, args.pred_len)
                 #pred_dict.update(baseline_preds)
-                context = "This is a 100 Hz lead II ECG waveform.Sharp rapid rises and falls are meaningful ECG components, not outliers.Preserve QRS-like sharp peaks and the recent rhythm when predicting the next waveform."
+                #context = "This is a 100 Hz lead II ECG waveform.Sharp rapid rises and falls are meaningful ECG components, not outliers.Preserve QRS-like sharp peaks and the recent rhythm when predicting the next waveform."
+                context = """
+                        Please predict the following ECG sequence carefully.
+
+                        Context knowledge you may consider:
+
+                        The given input is a one-dimensional numerical time series representing a Lead II ECG waveform before the prediction point. Only the values before the prediction point are provided. The goal is to predict the continuation of the ECG signal after the input value.
+
+                        Consider the ECG-specific temporal structure, including repeating cardiac cycles, P-QRS-T morphology, RR interval consistency, amplitude patterns, baseline drift, and local noise. Use the recent samples to estimate the current phase of the cardiac cycle and generate a realistic continuation.
+                        """
                 # ChatTime prediction
                 try:
                     y_pred_chattime = model.predict(hist, context=context)

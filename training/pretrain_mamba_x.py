@@ -206,7 +206,92 @@ def collect_numeric_token_ids_and_values(tokenizer):
     return numeric_token_ids, numeric_token_values
 def is_bfloat16_supported():
     return torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+@torch.no_grad()
+def initialize_added_token_embeddings_from_subtokens(
+    model,
+    tokenizer,
+    added_tokens,
+    subtoken_ids_by_token,
+    old_vocab_size,
+    init_noise_std=0.0,
+):
+    input_emb = model.get_input_embeddings()
+    input_w = input_emb.weight
 
+    output_emb = model.get_output_embeddings()
+    output_w = (
+        output_emb.weight
+        if output_emb is not None and hasattr(output_emb, "weight")
+        else None
+    )
+
+    device = input_w.device
+
+    old_input_mean = input_w[:old_vocab_size].mean(dim=0)
+
+    if output_w is not None:
+        old_output_mean = output_w[:old_vocab_size].mean(dim=0)
+    else:
+        old_output_mean = None
+
+    initialized = 0
+    skipped = 0
+
+    for tok in added_tokens:
+        new_id = tokenizer.convert_tokens_to_ids(tok)
+
+        if new_id is None or new_id < 0:
+            skipped += 1
+            continue
+
+        old_ids = subtoken_ids_by_token.get(tok, [])
+        old_ids = [
+            i for i in old_ids
+            if isinstance(i, int) and 0 <= i < old_vocab_size
+        ]
+
+        if len(old_ids) > 0:
+            old_ids_tensor = torch.tensor(
+                old_ids,
+                device=device,
+                dtype=torch.long,
+            )
+
+            new_input_vec = input_w[old_ids_tensor].mean(dim=0)
+
+            if output_w is not None:
+                new_output_vec = output_w[old_ids_tensor].mean(dim=0)
+            else:
+                new_output_vec = None
+        else:
+            new_input_vec = old_input_mean
+
+            if output_w is not None:
+                new_output_vec = old_output_mean
+            else:
+                new_output_vec = None
+
+        if init_noise_std > 0:
+            new_input_vec = (
+                new_input_vec
+                + init_noise_std * torch.randn_like(new_input_vec)
+            )
+
+            if new_output_vec is not None:
+                new_output_vec = (
+                    new_output_vec
+                    + init_noise_std * torch.randn_like(new_output_vec)
+                )
+
+        input_w[new_id].copy_(new_input_vec.to(dtype=input_w.dtype))
+
+        if output_w is not None:
+            output_w[new_id].copy_(new_output_vec.to(dtype=output_w.dtype))
+
+        initialized += 1
+
+    print(f"Initialized added token rows: {initialized}")
+    print(f"Skipped added token rows: {skipped}")
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--code_path", type=str, required=True, default=None)
@@ -279,8 +364,15 @@ if __name__ == "__main__":
     vocabulary = np.concatenate((discretizer.centers[1:-1], [np.nan])).reshape(-1, 1)
     vocabulary = np.array([serializer.serialize(i) for i in vocabulary])
     print(f"\nVocabulary: \n{vocabulary}\n")
+    old_vocab_size = len(tokenizer)
+
+    subtoken_ids_by_token = {
+        tok: tokenizer.encode(tok, add_special_tokens=False)
+        for tok in vocabulary.tolist()
+    }
 
     num_added_tokens = tokenizer.add_tokens(vocabulary.tolist())
+
     
     print(f"Added tokens: {num_added_tokens}")
     print(f"New tokenizer size: {len(tokenizer)}")
@@ -313,6 +405,7 @@ if __name__ == "__main__":
             "x_proj",
             "in_proj",
             "dt_proj",
+            "out_proj"
         ],
         modules_to_save=[
             "backbone.embeddings",
@@ -321,6 +414,14 @@ if __name__ == "__main__":
     )
 
     model = get_peft_model(model, lora_config)
+    print("Input embedding requires_grad:")
+    print(model.get_input_embeddings().weight.requires_grad)
+
+    output_emb = model.get_output_embeddings()
+    if output_emb is not None and hasattr(output_emb, "weight"):
+        print("Output embedding requires_grad:")
+        print(output_emb.weight.requires_grad)
+    
     model.print_trainable_parameters()
 
 

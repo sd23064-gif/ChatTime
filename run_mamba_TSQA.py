@@ -289,6 +289,26 @@ def calculate_confusion_matrix(result_df):
 
     return pd.DataFrame(rows)
 
+def calculate_accuracy_on_parsed(result_df):
+    parsed_df = result_df[result_df["parse_success"] == 1].copy()
+
+    if len(parsed_df) == 0:
+        return pd.DataFrame(columns=[
+            "model",
+            "accuracy_on_parsed",
+            "n_parsed",
+        ])
+
+    return (
+        parsed_df
+        .groupby(["model"], as_index=False)
+        .agg(
+            accuracy_on_parsed=("correct", "mean"),
+            n_parsed=("correct", "count"),
+        )
+        .sort_values("accuracy_on_parsed", ascending=False)
+        .reset_index(drop=True)
+    )
 
 # ============================================================
 # Build model configs
@@ -361,7 +381,44 @@ def build_model_configs(args):
             "top_p": args.top_p,
             "temperature": args.temperature,
         })
+    if args.normal_mamba_adapter is not None:
+        configs.append({
+            "name": "mamba_normal_finetuned",
+            "type": "mamba",
+            "base_model_path": args.mamba_base_model_path,
+            "adapter_path": args.normal_mamba_adapter,
+            "num_samples": args.num_samples,
+            "max_pred_len": args.max_pred_len,
+            "top_k": args.top_k,
+            "top_p": args.top_p,
+            "temperature": args.temperature,
+        })
 
+    if args.value_norm_pretrain_adapter is not None:
+        configs.append({
+            "name": "mamba_value_norm_pretrain",
+            "type": "mamba",
+            "base_model_path": args.mamba_base_model_path,
+            "adapter_path": args.value_norm_pretrain_adapter,
+            "num_samples": args.num_samples,
+            "max_pred_len": args.max_pred_len,
+            "top_k": args.top_k,
+            "top_p": args.top_p,
+            "temperature": args.temperature,
+        })
+
+    if args.value_norm_finetune_adapter is not None:
+        configs.append({
+            "name": "mamba_value_norm_finetuned",
+            "type": "mamba",
+            "base_model_path": args.mamba_base_model_path,
+            "adapter_path": args.value_norm_finetune_adapter,
+            "num_samples": args.num_samples,
+            "max_pred_len": args.max_pred_len,
+            "top_k": args.top_k,
+            "top_p": args.top_p,
+            "temperature": args.temperature,
+        })
     return configs
 
 
@@ -402,7 +459,9 @@ def main():
     parser.add_argument("--mamba_finetune_adapter", type=str, default=None)
 
     parser.add_argument("--debug_first_n", type=int, default=3)
-
+    parser.add_argument("--normal_mamba_adapter", type=str, default=None)
+    parser.add_argument("--value_norm_pretrain_adapter", type=str, default=None)
+    parser.add_argument("--value_norm_finetune_adapter", type=str, default=None)
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -583,6 +642,26 @@ def main():
     summary_size_df = calculate_summary_by_size(result_df)
     summary_task_size_df = calculate_summary_by_task_size(result_df)
     overall_df = calculate_overall_summary(result_df)
+    baseline_name = "mamba_normal_finetuned"
+
+    if baseline_name in overall_df["model"].values:
+        baseline_acc = overall_df.loc[
+            overall_df["model"] == baseline_name,
+            "accuracy"
+        ].iloc[0]
+
+        overall_df["accuracy_delta_vs_normal_mamba"] = (
+            overall_df["accuracy"] - baseline_acc
+        )
+
+        overall_df["accuracy_improvement_vs_normal_mamba_pct"] = (
+            (overall_df["accuracy"] - baseline_acc) / baseline_acc * 100.0
+            if baseline_acc != 0
+            else np.nan
+        )
+    else:
+        overall_df["accuracy_delta_vs_normal_mamba"] = np.nan
+        overall_df["accuracy_improvement_vs_normal_mamba_pct"] = np.nan
     confusion_df = calculate_confusion_matrix(result_df)
 
     summary_task_path = os.path.join(
@@ -611,7 +690,16 @@ def main():
     summary_task_size_df.to_csv(summary_task_size_path, index=False)
     overall_df.to_csv(overall_path, index=False)
     confusion_df.to_csv(confusion_path, index=False)
+    accuracy_on_parsed_df = calculate_accuracy_on_parsed(result_df)
 
+    accuracy_on_parsed_path = os.path.join(
+        args.output_dir,
+        "tsqa_model_comparison_accuracy_on_parsed.csv",
+    )
+
+    accuracy_on_parsed_df.to_csv(accuracy_on_parsed_path, index=False)
+
+    print(" -", accuracy_on_parsed_path)
     print("\nOverall summary:")
     print(overall_df)
 

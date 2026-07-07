@@ -109,7 +109,7 @@ if __name__ == "__main__":
         target_modules=[
             "x_proj",
             "in_proj",
-            "dt_proj"
+            "dt_proj",
             "out_proj",
         ],
         modules_to_save=[
@@ -129,10 +129,10 @@ if __name__ == "__main__":
 
     print(f"\nLoading dataset in {args.dataset_path}")
     dataset = load_dataset(
-            "csv",
-            data_files=f"https://huggingface.co/datasets/{args.dataset_path}/resolve/main/ChatTime-1-Pretrain-1M.csv",
-            split="train",
-        )
+                "csv",
+                data_files=f"https://huggingface.co/datasets/{args.dataset_path}/resolve/main/ChatTime-1-Pretrain-1M.csv",
+                split="train",
+            )
 
     print(f"Dataset example: \n{dataset[0]['text']}\n")
 

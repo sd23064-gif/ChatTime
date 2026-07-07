@@ -1,12 +1,27 @@
+import os
+
+# Unsloth / torch.compile の自動コンパイルを無効化
+os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"
+os.environ["UNSLOTH_COMPILE_IGNORE_ERRORS"] = "1"
+
+# TorchInductor 系も抑制
+os.environ["TORCH_COMPILE"] = "0"
+os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "0"
+os.environ["TORCHINDUCTOR_AUTOGRAD_CACHE"] = "0"
+
+# もし logits 周りのエラーが再発する場合だけ有効化
+# os.environ["UNSLOTH_RETURN_LOGITS"] = "1"
+
 import argparse
 import sys
 
 from unsloth import FastLanguageModel, is_bfloat16_supported
+
 import numpy as np
 import torch
 from datasets import load_dataset
-from transformers import TrainingArguments, LlamaTokenizer
-from trl import SFTTrainer
+from transformers import AutoTokenizer
+from trl import SFTTrainer, SFTConfig
 
 
 import torch.nn.functional as F
@@ -139,26 +154,116 @@ class NumericEmbeddingRegularizedSFTTrainer(SFTTrainer):
 
         if isinstance(outputs, dict):
             lm_loss = outputs["loss"]
+        elif hasattr(outputs, "loss"):
+            lm_loss = outputs.loss
         else:
             lm_loss = outputs[0]
 
         if self.embedding_reg_weight > 0:
             emb_reg_loss = self.numeric_embedding_regularization_loss(model)
-            loss = lm_loss + self.embedding_reg_weight * emb_reg_loss
+            weighted_emb_reg_loss = self.embedding_reg_weight * emb_reg_loss
+            loss = lm_loss + weighted_emb_reg_loss
         else:
             emb_reg_loss = torch.tensor(0.0, device=lm_loss.device)
+            weighted_emb_reg_loss = torch.tensor(0.0, device=lm_loss.device)
             loss = lm_loss
 
-        # logging用
         if self.state.global_step % max(1, self.args.logging_steps) == 0:
             self.log({
                 "lm_loss": lm_loss.detach().float().item(),
                 "numeric_embedding_reg_loss": emb_reg_loss.detach().float().item(),
+                "weighted_numeric_embedding_reg_loss": weighted_emb_reg_loss.detach().float().item(),
                 "total_loss_with_numeric_reg": loss.detach().float().item(),
             })
 
         return (loss, outputs) if return_outputs else loss
-    
+@torch.no_grad()
+def initialize_added_token_embeddings_from_subtokens(
+    model,
+    tokenizer,
+    added_tokens,
+    subtoken_ids_by_token,
+    old_vocab_size,
+    init_noise_std=0.0,
+):
+    input_emb = model.get_input_embeddings()
+    input_w = input_emb.weight
+
+    output_emb = model.get_output_embeddings()
+    output_w = (
+        output_emb.weight
+        if output_emb is not None and hasattr(output_emb, "weight")
+        else None
+    )
+
+    device = input_w.device
+
+    old_input_mean = input_w[:old_vocab_size].mean(dim=0)
+
+    if output_w is not None:
+        old_output_mean = output_w[:old_vocab_size].mean(dim=0)
+    else:
+        old_output_mean = None
+
+    initialized = 0
+    skipped = 0
+
+    for tok in added_tokens:
+        new_id = tokenizer.convert_tokens_to_ids(tok)
+
+        if new_id is None or new_id < 0:
+            skipped += 1
+            continue
+
+        old_ids = subtoken_ids_by_token.get(tok, [])
+        old_ids = [
+            i for i in old_ids
+            if isinstance(i, int) and 0 <= i < old_vocab_size
+        ]
+
+        if len(old_ids) > 0:
+            old_ids_tensor = torch.tensor(
+                old_ids,
+                device=device,
+                dtype=torch.long,
+            )
+
+            new_input_vec = input_w[old_ids_tensor].mean(dim=0)
+
+            if output_w is not None:
+                new_output_vec = output_w[old_ids_tensor].mean(dim=0)
+            else:
+                new_output_vec = None
+        else:
+            new_input_vec = old_input_mean
+
+            if output_w is not None:
+                new_output_vec = old_output_mean
+            else:
+                new_output_vec = None
+
+        if init_noise_std > 0:
+            new_input_vec = (
+                new_input_vec
+                + init_noise_std * torch.randn_like(new_input_vec)
+            )
+
+            if new_output_vec is not None:
+                new_output_vec = (
+                    new_output_vec
+                    + init_noise_std * torch.randn_like(new_output_vec)
+                )
+
+        input_w[new_id].copy_(new_input_vec.to(dtype=input_w.dtype))
+
+        if output_w is not None:
+            output_w[new_id].copy_(new_output_vec.to(dtype=output_w.dtype))
+
+        initialized += 1
+
+    print(f"Initialized added token rows: {initialized}")
+    print(f"Skipped added token rows: {skipped}")
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--code_path", type=str, required=True, default=None)
@@ -209,6 +314,7 @@ if __name__ == "__main__":
     parser.add_argument("--regularize_lm_head", action="store_true", default=False)
 
     parser.add_argument("--wandb_run_name", type=str, default=None)
+    parser.add_argument("--learning_rate", type=float, default=5e-5)
     args = parser.parse_args()
 
     sys.path.append(args.code_path)
@@ -216,32 +322,53 @@ if __name__ == "__main__":
 
     if args.wandb_run_name is None:
         args.wandb_run_name = (
-            f"mamba-{args.model_path.split('/')[-1]}"
+            f"numeric-reg-{args.model_path.split('/')[-1]}"
             f"-bs{args.per_device_train_batch_size}"
             f"-ga{args.gradient_accumulation_steps}"
+            f"-lr{args.learning_rate}"
+            f"-reg{args.embedding_reg_weight}"
         )
 
     # construct vocabulary
     discretizer = Discretizer(low_limit=args.low_limit, high_limit=args.high_limit, n_tokens=args.n_tokens)
     serializer = Serializer(prec=args.prec, time_sep=args.time_sep, time_flag=args.time_flag, nan_flag=args.nan_flag)
 
-    vocabulary = np.concatenate((discretizer.centers[1:-1], [np.NaN])).reshape(-1, 1)
+    vocabulary = np.concatenate((discretizer.centers[1:-1], [np.nan])).reshape(-1, 1)
     vocabulary = np.array([serializer.serialize(i) for i in vocabulary])
     print(f"\nVocabulary: \n{vocabulary}\n")
 
     
     # add token to llama tokenizer
-    tokenizer = LlamaTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
-    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_path,
+        trust_remote_code=True,
+        use_fast=True,
+    )
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
     tokenizer.padding_side = "right"
+
     print(f"Old model pieces: {len(tokenizer.get_vocab())}")
-    tokenizer.add_tokens(vocabulary.tolist())
+    old_vocab_size = len(tokenizer)
+
+    # 追加前の tokenizer で、各数値tokenが既存subtokenにどう分解されるか記録
+    subtoken_ids_by_token = {
+        tok: tokenizer.encode(tok, add_special_tokens=False)
+        for tok in vocabulary.tolist()
+    }
+
+    num_added_tokens = tokenizer.add_tokens(vocabulary.tolist())
+
+    print(f"Added tokens: {num_added_tokens}")
+    print(f"New model pieces: {len(tokenizer.get_vocab())}")
     # finite numeric token only, excluding Nan
     finite_values = discretizer.centers[1:-1].astype(np.float32)
     finite_tokens = vocabulary[:-1].tolist()
 
+    
     numeric_token_ids = tokenizer.convert_tokens_to_ids(finite_tokens)
-
     if any(tid is None or tid < 0 for tid in numeric_token_ids):
         bad = [
             (tok, tid)
@@ -261,6 +388,7 @@ if __name__ == "__main__":
     EOS_TOKEN = tokenizer.eos_token
 
     # load model
+
     model, _ = FastLanguageModel.from_pretrained(
         model_name=args.model_path,
         max_seq_length=args.max_seq_length,
@@ -268,6 +396,16 @@ if __name__ == "__main__":
         load_in_4bit=args.load_in_4bit,
         resize_model_vocab=len(tokenizer.get_vocab()),
     )
+
+    initialize_added_token_embeddings_from_subtokens(
+        model=model,
+        tokenizer=tokenizer,
+        added_tokens=vocabulary.tolist(),
+        subtoken_ids_by_token=subtoken_ids_by_token,
+        old_vocab_size=old_vocab_size,
+        init_noise_std=0.0,
+    )
+
 
     # add lora to llama model
     model = FastLanguageModel.get_peft_model(
@@ -285,28 +423,72 @@ if __name__ == "__main__":
 
 
     # load dataset
-    def formatting_func(example):
-        return example["text"] + EOS_TOKEN
 
 
     print(f"\nLoading dataset in {args.dataset_path}")
     dataset = load_dataset(
-            "csv",
-            data_files=f"https://huggingface.co/datasets/{args.dataset_path}/resolve/main/ChatTime-1-Pretrain-1M.csv",
-            split="train",
-        )
+        "csv",
+        data_files=f"https://huggingface.co/datasets/{args.dataset_path}/resolve/main/ChatTime-1-Pretrain-1M.csv",
+        split="train",
+    )
+
     print(f"Dataset example: \n{dataset[0]['text']}\n")
 
+    dataset = dataset.map(
+        lambda x: {"text": x["text"] + EOS_TOKEN},
+    )
+
+    sample = dataset[0]["text"].split()[:10]
+    for tok in sample:
+        ids = tokenizer.encode(tok, add_special_tokens=False)
+        print(tok, ids, len(ids))
+
     # train model
+    training_args = SFTConfig(
+        output_dir=args.log_path,
+
+        per_device_train_batch_size=args.per_device_train_batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        num_train_epochs=args.num_train_epochs,
+        max_steps=args.max_steps,
+
+        weight_decay=0.01,
+        warmup_steps=0,
+        max_grad_norm=1.0,
+        learning_rate=args.learning_rate,
+
+        logging_strategy="steps",
+        logging_steps=args.logging_steps,
+        save_strategy="steps",
+        save_steps=args.save_steps,
+        save_total_limit=1,
+        logging_first_step=True,
+
+        optim="adamw_8bit",
+        lr_scheduler_type="cosine",
+        seed=args.random_seed,
+
+        fp16=not is_bfloat16_supported(),
+        bf16=is_bfloat16_supported(),
+
+        dataset_text_field="text",
+        max_length=args.max_seq_length,
+        packing=False,
+
+        # 最初は1推奨。動作確認後に 4, 8 へ上げる
+        dataset_num_proc=1,
+
+        torch_compile=False,
+
+        report_to="wandb",
+        run_name=args.wandb_run_name,
+    )
+
     trainer = NumericEmbeddingRegularizedSFTTrainer(
         model=model,
-        tokenizer=tokenizer,
+        args=training_args,
         train_dataset=dataset,
-        dataset_text_field="text",
-        max_seq_length=args.max_seq_length,
-        dataset_num_proc=64,
-        packing=False,
-        formatting_func=formatting_func,
+        processing_class=tokenizer,
 
         numeric_token_ids=numeric_token_ids,
         numeric_token_values=numeric_token_values,
@@ -317,34 +499,7 @@ if __name__ == "__main__":
         embedding_reg_close_margin=args.embedding_reg_close_margin,
         embedding_reg_far_margin=args.embedding_reg_far_margin,
         regularize_lm_head=args.regularize_lm_head,
-
-        args=TrainingArguments(
-            per_device_train_batch_size=args.per_device_train_batch_size,
-            gradient_accumulation_steps=args.gradient_accumulation_steps,
-            num_train_epochs=args.num_train_epochs,
-            weight_decay=0.01,
-            warmup_ratio=0.05,
-            max_grad_norm=1.0,
-            learning_rate=2e-4,
-            logging_strategy="steps",
-            logging_steps=args.logging_steps,
-            save_strategy="steps",
-            save_steps=args.save_steps,
-            max_steps=args.max_steps,
-            save_total_limit=1,
-            logging_first_step=True,
-            optim="adamw_8bit",
-            lr_scheduler_type="cosine",
-            seed=args.random_seed,
-            output_dir=args.log_path,
-            fp16=not is_bfloat16_supported(),
-            bf16=is_bfloat16_supported(),
-
-            report_to="wandb",
-            run_name=args.wandb_run_name,
-        ),
     )
-
     # title Show current memory stats
     gpu_stats = torch.cuda.get_device_properties(0)
     start_gpu_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
@@ -367,4 +522,12 @@ if __name__ == "__main__":
     print(f"Peak reserved memory for training % of max memory = {lora_percentage} %.\n")
 
     # save model and tokenizer
-    model.save_pretrained_merged(args.output_path, tokenizer)
+    print(f"Saving LoRA adapter to {args.output_path}")
+    model.save_pretrained(args.output_path)
+    tokenizer.save_pretrained(args.output_path)
+
+    print(f"Saving merged model to {args.output_path}_merged")
+    model.save_pretrained_merged(
+        args.output_path + "_merged",
+        tokenizer,
+    )
