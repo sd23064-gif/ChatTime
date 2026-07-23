@@ -5,6 +5,8 @@ import os
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from datasets import load_dataset
 # 【変更前】
 # from transformers import TrainingArguments, LlamaTokenizer
@@ -170,7 +172,6 @@ def register_added_token_gradient_mask(
 
     return weight.register_hook(mask_gradient)
 
-
 def parse_periods(text):
     periods = [float(item.strip()) for item in text.split(",") if item.strip()]
     if not periods or any(period <= 0 for period in periods):
@@ -178,83 +179,126 @@ def parse_periods(text):
     return periods
 
 
-def make_fone_features(values, periods, output_dim, scale=1.0):
-    """Return deterministic multi-scale Fourier features for scalar values."""
+def make_fone_features(values, periods):
     values = values.to(torch.float64).reshape(-1, 1)
-    periods = torch.tensor(periods, dtype=torch.float64).reshape(1, -1)
-    angles = 2.0 * torch.pi * values / periods
-    base = torch.stack((torch.cos(angles), torch.sin(angles)), dim=-1).flatten(1)
-
-    if output_dim <= base.shape[1]:
-        features = base[:, :output_dim]
-    else:
-        repeats = (output_dim + base.shape[1] - 1) // base.shape[1]
-        features = base.repeat(1, repeats)[:, :output_dim]
-
-    return (features * scale).to(torch.float32)
+    periods_tensor = torch.tensor(periods, dtype=torch.float64, device=values.device).reshape(1, -1)
+    angles = 2.0 * torch.pi * values / periods_tensor
+    return torch.stack((torch.cos(angles), torch.sin(angles)), dim=-1).flatten(1).float()
 
 
-def make_random_fixed_features(num_tokens, output_dim, scale, seed):
-    """Random fixed control with row-wise RMS matched to FoNE scale."""
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed(seed)
-    features = torch.randn(num_tokens, output_dim, generator=generator)
-    rms = features.square().mean(dim=1, keepdim=True).sqrt().clamp_min(1e-8)
-    return (features / rms * scale).to(torch.float32)
+class FoNEFeatureAdapter(nn.Module):
+    """Absolute-value and first-difference FoNE additions for token embeddings."""
+    def __init__(self, vocab_size, model_dim, numeric_ids, numeric_values, periods,
+                 mode="none", scale=1.0, projection_trainable=True):
+        super().__init__()
+        self.mode = mode
+        self.scale = float(scale)
+        self.periods = list(periods)
+        self.feature_dim = 2 * len(periods)
 
+        value_table = torch.zeros(vocab_size, dtype=torch.float32)
+        numeric_mask = torch.zeros(vocab_size, dtype=torch.bool)
+        value_table[numeric_ids] = numeric_values.float()
+        numeric_mask[numeric_ids] = True
+        self.register_buffer("value_table", value_table)
+        self.register_buffer("numeric_mask", numeric_mask)
 
-def register_hybrid_gradient_mask(weight, numeric_ids, fixed_dim, freeze_all=False):
-    numeric_ids_cpu = numeric_ids.detach().cpu().long()
+        feature_table = torch.zeros(vocab_size, self.feature_dim, dtype=torch.float32)
+        feature_table[numeric_ids] = make_fone_features(numeric_values, periods)
+        self.register_buffer("absolute_feature_table", feature_table)
 
-    def mask_gradient(gradient):
-        masked = gradient.clone()
-        ids = numeric_ids_cpu.to(masked.device)
-        if freeze_all:
-            masked.index_fill_(0, ids, 0.0)
+        self.absolute_projection = None
+        self.delta_projection = None
+        if mode in {"additive_projection", "absolute_delta"}:
+            self.absolute_projection = nn.Linear(self.feature_dim, model_dim, bias=False)
+            nn.init.normal_(self.absolute_projection.weight, mean=0.0, std=0.02)
+            self.absolute_projection.weight.requires_grad_(projection_trainable)
+        if mode == "absolute_delta":
+            self.delta_projection = nn.Linear(self.feature_dim, model_dim, bias=False)
+            nn.init.normal_(self.delta_projection.weight, mean=0.0, std=0.02)
+            self.delta_projection.weight.requires_grad_(projection_trainable)
+
+    def forward(self, input_ids, base_embeddings):
+        if self.mode == "none":
+            return base_embeddings
+
+        dtype = base_embeddings.dtype
+        absolute_features = self.absolute_feature_table[input_ids].to(dtype)
+        numeric = self.numeric_mask[input_ids]
+
+        if self.mode == "residual":
+            model_dim = base_embeddings.shape[-1]
+            fixed = absolute_features[..., :model_dim] if self.feature_dim >= model_dim else F.pad(
+                absolute_features, (0, model_dim - self.feature_dim)
+            )
+            output = base_embeddings + self.scale * fixed
         else:
-            selected = masked.index_select(0, ids)
-            selected[:, :fixed_dim] = 0
-            masked.index_copy_(0, ids, selected)
-        return masked
+            output = base_embeddings + self.scale * self.absolute_projection(absolute_features)
 
-    return weight.register_hook(mask_gradient)
+        if self.mode == "absolute_delta":
+            values = self.value_table[input_ids]
+            previous_values = torch.roll(values, shifts=1, dims=1)
+            previous_numeric = torch.roll(numeric, shifts=1, dims=1)
+            previous_numeric[:, 0] = False
+            valid_delta = numeric & previous_numeric
+            delta_values = torch.where(valid_delta, values - previous_values, torch.zeros_like(values))
+            flat_delta = delta_values.reshape(-1).float()
+            delta_features = make_fone_features(flat_delta, self.periods).to(
+                device=input_ids.device, dtype=dtype
+            ).reshape(*input_ids.shape, self.feature_dim)
+            delta_features = delta_features * valid_delta.unsqueeze(-1)
+            output = output + self.scale * self.delta_projection(delta_features)
+
+        return output
 
 
-class RestoreFixedNumericEmbeddingCallback(TrainerCallback):
-    """Prevent AdamW weight decay from moving the fixed numeric subspace."""
-    def __init__(self, embedding, numeric_ids, fixed_values, fixed_dim, freeze_all=False):
-        self.embedding = embedding
-        self.numeric_ids = numeric_ids.detach().cpu().long()
-        self.fixed_values = fixed_values.detach().cpu()
-        self.fixed_dim = fixed_dim
-        self.freeze_all = freeze_all
+class FoNERegularizedSFTTrainer(SFTTrainer):
+    def __init__(self, *args, numeric_token_ids=None, smoothness_lambda=0.0,
+                 residual_lambda=0.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.numeric_token_ids_for_reg = numeric_token_ids
+        self.smoothness_lambda = float(smoothness_lambda)
+        self.residual_lambda = float(residual_lambda)
 
-    @torch.no_grad()
-    def restore(self):
-        weight = self.embedding.weight
-        ids = self.numeric_ids.to(weight.device)
-        values = self.fixed_values.to(device=weight.device, dtype=weight.dtype)
-        if self.freeze_all:
-            weight.index_copy_(0, ids, values)
-        else:
-            rows = weight.index_select(0, ids)
-            rows[:, :self.fixed_dim] = values
-            weight.index_copy_(0, ids, rows)
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        input_ids = inputs.get("input_ids")
+        forward_inputs = dict(inputs)
+        adapter = getattr(model, "numeric_fone_adapter", None)
+        if adapter is not None and input_ids is not None:
+            base_embeddings = model.get_input_embeddings()(input_ids)
+            forward_inputs.pop("input_ids")
+            forward_inputs["inputs_embeds"] = adapter(input_ids, base_embeddings)
 
-    def on_train_begin(self, args, state, control, **kwargs):
-        self.restore()
-        return control
+        outputs = model(**forward_inputs)
+        loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
 
-    def on_step_end(self, args, state, control, **kwargs):
-        self.restore()
-        return control
+        if self.numeric_token_ids_for_reg is not None:
+            ids = self.numeric_token_ids_for_reg.to(model.get_input_embeddings().weight.device)
+            numeric_embeddings = model.get_input_embeddings().weight.index_select(0, ids)
+            if self.smoothness_lambda > 0 and numeric_embeddings.shape[0] > 1:
+                smoothness_loss = (numeric_embeddings[1:] - numeric_embeddings[:-1]).square().mean()
+                loss = loss + self.smoothness_lambda * smoothness_loss
+                if self.state.global_step % max(1, self.args.logging_steps) == 0:
+                    self.log({"smoothness_loss": smoothness_loss.detach().float().item()})
+            if self.residual_lambda > 0:
+                residual_loss = numeric_embeddings.square().mean()
+                loss = loss + self.residual_lambda * residual_loss
+                if self.state.global_step % max(1, self.args.logging_steps) == 0:
+                    self.log({"residual_loss": residual_loss.detach().float().item()})
+
+        return (loss, outputs) if return_outputs else loss
+
+
+class SaveFoNEAdapterCallback(TrainerCallback):
+    def __init__(self, model):
+        self.model = model
 
     def on_save(self, args, state, control, **kwargs):
-        self.restore()
-        return control
-
-    def on_train_end(self, args, state, control, **kwargs):
-        self.restore()
+        adapter = getattr(self.model, "numeric_fone_adapter", None)
+        if adapter is not None:
+            checkpoint_dir = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            torch.save(adapter.state_dict(), os.path.join(checkpoint_dir, "numeric_fone_adapter.pt"))
         return control
 
 
@@ -311,7 +355,7 @@ if __name__ == "__main__":
     parser.add_argument("--per_device_eval_batch_size", type=int, default=None)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=32)
     parser.add_argument("--save_steps", type=int, default=250)
-    parser.add_argument("--logging_steps", type=int, default=50)
+    parser.add_argument("--logging_steps", type=int, default=20)
     parser.add_argument("--max_steps", type=int, default=-1)
 
     parser.add_argument("--low_limit", type=float, default=-1)
@@ -333,16 +377,12 @@ if __name__ == "__main__":
     parser.add_argument("--dataset_num_proc", type=int, default=64)
     parser.add_argument("--learning_rate", type=float, default=2e-4)
 
-    # Numeric embedding experiment
-    parser.add_argument(
-        "--embedding_experiment",
-        choices=["baseline", "fone_hybrid", "random_hybrid", "fone_only"],
-        default="baseline",
-    )
-    parser.add_argument("--fone_fixed_dim", type=int, default=16)
+    parser.add_argument("--fone_mode", choices=["none", "additive_projection", "residual", "absolute_delta"], default="none")
     parser.add_argument("--fone_periods", type=str, default="0.001,0.01,0.1,1,10")
     parser.add_argument("--fone_scale", type=float, default=1.0)
-    parser.add_argument("--fixed_feature_seed", type=int, default=2026)
+    parser.add_argument("--freeze_fone_projection", action="store_true", default=False)
+    parser.add_argument("--smoothness_lambda", type=float, default=0.0)
+    parser.add_argument("--residual_lambda", type=float, default=0.0)
 
     parser.add_argument("--wandb_run_name", type=str, default=None)
     args = parser.parse_args()
@@ -361,7 +401,7 @@ if __name__ == "__main__":
             f"mamba-{args.model_path.split('/')[-1]}"
             f"-bs{args.per_device_train_batch_size}"
             f"-ga{args.gradient_accumulation_steps}"
-            f"-{args.embedding_experiment}"
+            f"-{args.fone_mode}"
         )
     # construct vocabulary
     
@@ -472,72 +512,19 @@ if __name__ == "__main__":
             output_embedding.weight,
             old_vocab_size,
     )
-    # ------------------------------------------------------------
-    # Initialize the numeric input embeddings for the experiment.
-    # The LM head remains trainable in all conditions so that output
-    # token learning is identical across experiments.
-    # ------------------------------------------------------------
     numeric_token_ids, numeric_token_values = collect_numeric_token_ids(tokenizer)
-    numeric_embedding_callback = None
-    numeric_fixed_values = None
-    fixed_dim_used = 0
-    freeze_all_numeric_input = False
-
-    if args.embedding_experiment != "baseline":
-        embedding_dim = input_embedding.weight.shape[1]
-        periods = parse_periods(args.fone_periods)
-
-        if args.embedding_experiment == "fone_only":
-            fixed_dim_used = embedding_dim
-            freeze_all_numeric_input = True
-            numeric_fixed_values = make_fone_features(
-                numeric_token_values, periods, embedding_dim, args.fone_scale
-            )
-        else:
-            if not 0 < args.fone_fixed_dim < embedding_dim:
-                raise ValueError(
-                    f"--fone_fixed_dim must be between 1 and {embedding_dim - 1}"
-                )
-            fixed_dim_used = args.fone_fixed_dim
-            if args.embedding_experiment == "fone_hybrid":
-                numeric_fixed_values = make_fone_features(
-                    numeric_token_values, periods, fixed_dim_used, args.fone_scale
-                )
-            elif args.embedding_experiment == "random_hybrid":
-                numeric_fixed_values = make_random_fixed_features(
-                    len(numeric_token_ids), fixed_dim_used, args.fone_scale,
-                    args.fixed_feature_seed,
-                )
-
-        numeric_ids_device = numeric_token_ids.to(input_embedding.weight.device)
-        fixed_device = numeric_fixed_values.to(
-            device=input_embedding.weight.device, dtype=input_embedding.weight.dtype
-        )
-        with torch.no_grad():
-            if freeze_all_numeric_input:
-                input_embedding.weight.index_copy_(0, numeric_ids_device, fixed_device)
-            else:
-                rows = input_embedding.weight.index_select(0, numeric_ids_device)
-                rows[:, :fixed_dim_used] = fixed_device
-                input_embedding.weight.index_copy_(0, numeric_ids_device, rows)
-
-        numeric_fixed_grad_hook = register_hybrid_gradient_mask(
-            input_embedding.weight, numeric_token_ids, fixed_dim_used,
-            freeze_all=freeze_all_numeric_input,
-        )
-        numeric_embedding_callback = RestoreFixedNumericEmbeddingCallback(
-            input_embedding, numeric_token_ids, numeric_fixed_values, fixed_dim_used,
-            freeze_all=freeze_all_numeric_input,
-        )
-
-        print("\nNumeric embedding experiment")
-        print("mode:", args.embedding_experiment)
-        print("numeric tokens:", len(numeric_token_ids))
-        print("embedding dim:", embedding_dim)
-        print("fixed dim:", fixed_dim_used)
-        print("learned dim:", 0 if freeze_all_numeric_input else embedding_dim - fixed_dim_used)
-        print("periods:", periods if "fone" in args.embedding_experiment else "random control")
-        print("fixed feature scale:", args.fone_scale)
+    periods = parse_periods(args.fone_periods)
+    numeric_fone_adapter = None
+    if args.fone_mode != "none":
+        numeric_fone_adapter = FoNEFeatureAdapter(
+            len(tokenizer), input_embedding.weight.shape[1], numeric_token_ids,
+            numeric_token_values, periods, args.fone_mode, args.fone_scale,
+            not args.freeze_fone_projection,
+        ).to(device=input_embedding.weight.device, dtype=input_embedding.weight.dtype)
+        model.add_module("numeric_fone_adapter", numeric_fone_adapter)
+        print("\nFoNE mode:", args.fone_mode)
+        print("FoNE periods:", periods)
+        print("FoNE feature dim:", numeric_fone_adapter.feature_dim)
 
     inspect_embedding_trainability(model)
 
@@ -597,13 +584,9 @@ if __name__ == "__main__":
         numeric_ids=numeric_token_ids,
         sample_size=10000,
     )
-    callbacks = [
-        SaveTokenizerAtCheckpointCallback(
-            tokenizer=tokenizer,
-        )
-    ]
-    if numeric_embedding_callback is not None:
-        callbacks.append(numeric_embedding_callback)
+    callbacks = [SaveTokenizerAtCheckpointCallback(tokenizer=tokenizer)]
+    if numeric_fone_adapter is not None:
+        callbacks.append(SaveFoNEAdapterCallback(model))
     has_eval = eval_dataset is not None
     if has_eval:
         callbacks.append(
@@ -624,7 +607,7 @@ if __name__ == "__main__":
 
     print(f"Saved step-0 adapter to: {step0_path}")
     # train model
-    trainer = SFTTrainer(
+    trainer = FoNERegularizedSFTTrainer(
         model=model,
         tokenizer=tokenizer,
         train_dataset=train_dataset,
@@ -678,6 +661,9 @@ if __name__ == "__main__":
             run_name=args.wandb_run_name,
         ),
         callbacks=callbacks,
+        numeric_token_ids=numeric_token_ids,
+        smoothness_lambda=args.smoothness_lambda,
+        residual_lambda=args.residual_lambda if args.fone_mode == "residual" else 0.0,
     )
 
     # title Show current memory stats
@@ -692,17 +678,28 @@ if __name__ == "__main__":
     initial_numeric_embeddings = model.get_input_embeddings().weight[numeric_ids_device].detach().float().cpu().clone()
 
     torch.save({
-        "token_ids": numeric_token_ids,
-        "values": numeric_token_values,
-        "embeddings": initial_numeric_embeddings,
-        "experiment": args.embedding_experiment,
-        "fixed_dim": fixed_dim_used,
-        "fone_periods": args.fone_periods,
-        "fone_scale": args.fone_scale,
-        "fixed_values": numeric_fixed_values,
+        "token_ids": numeric_token_ids, "values": numeric_token_values,
+        "embeddings": initial_numeric_embeddings, "fone_mode": args.fone_mode,
+        "fone_periods": args.fone_periods, "fone_scale": args.fone_scale,
+        "smoothness_lambda": args.smoothness_lambda,
+        "residual_lambda": args.residual_lambda,
     }, os.path.join(step0_path, "numeric_embeddings_step0.pt"))
+    if numeric_fone_adapter is not None:
+        torch.save(numeric_fone_adapter.state_dict(), os.path.join(step0_path, "numeric_fone_adapter.pt"))
 
     trainer_stats = trainer.train()
+
+    # PEFT checkpoints do not necessarily include custom sidecar modules.
+    # When load_best_model_at_end is enabled, restore the matching FoNE adapter.
+    if numeric_fone_adapter is not None and trainer.state.best_model_checkpoint is not None:
+        best_adapter_path = os.path.join(
+            trainer.state.best_model_checkpoint,
+            "numeric_fone_adapter.pt",
+        )
+        if os.path.exists(best_adapter_path):
+            state_dict = torch.load(best_adapter_path, map_location="cpu")
+            numeric_fone_adapter.load_state_dict(state_dict)
+            print("Loaded best FoNE adapter from:", best_adapter_path)
 
     trained_numeric_embeddings = (
         model.get_input_embeddings()
@@ -714,17 +711,6 @@ if __name__ == "__main__":
 
     delta = trained_numeric_embeddings - initial_numeric_embeddings
     l2_change = delta.norm(dim=-1)
-
-    if fixed_dim_used > 0:
-        fixed_l2_change = delta[:, :fixed_dim_used].norm(dim=-1)
-        learned_l2_change = (
-            delta[:, fixed_dim_used:].norm(dim=-1)
-            if fixed_dim_used < delta.shape[1]
-            else torch.zeros_like(fixed_l2_change)
-        )
-    else:
-        fixed_l2_change = torch.zeros_like(l2_change)
-        learned_l2_change = l2_change.clone()
 
     initial_dir = torch.nn.functional.normalize(
         initial_numeric_embeddings,
@@ -777,11 +763,7 @@ if __name__ == "__main__":
             "trained_norm": trained_norm.cpu().numpy(),
             "norm_change": norm_change.cpu().numpy(),
             "l2_change": l2_change.cpu().numpy(),
-            "fixed_l2_change": fixed_l2_change.cpu().numpy(),
-            "learned_l2_change": learned_l2_change.cpu().numpy(),
             "relative_l2_change": relative_l2_change.cpu().numpy(),
-            "embedding_experiment": args.embedding_experiment,
-            "fixed_dim": fixed_dim_used,
             "initial_trained_cosine": (
                 cos_initial_trained.cpu().numpy()
             ),
@@ -922,11 +904,22 @@ if __name__ == "__main__":
         update_csv_path,
     )
     # save model and tokenizer
-    if numeric_embedding_callback is not None:
-        numeric_embedding_callback.restore()
     print(f"Saving LoRA adapter to {args.output_path}")
 
     model.save_pretrained(args.output_path)
     tokenizer.save_pretrained(args.output_path)
+
+    if numeric_fone_adapter is not None:
+        torch.save(
+            numeric_fone_adapter.state_dict(),
+            os.path.join(args.output_path, "numeric_fone_adapter.pt"),
+        )
+        with open(os.path.join(args.output_path, "numeric_fone_config.txt"), "w", encoding="utf-8") as file:
+            file.write(f"fone_mode={args.fone_mode}\n")
+            file.write(f"fone_periods={args.fone_periods}\n")
+            file.write(f"fone_scale={args.fone_scale}\n")
+            file.write(f"freeze_fone_projection={args.freeze_fone_projection}\n")
+            file.write(f"smoothness_lambda={args.smoothness_lambda}\n")
+            file.write(f"residual_lambda={args.residual_lambda}\n")
 
     print("Save completed")
