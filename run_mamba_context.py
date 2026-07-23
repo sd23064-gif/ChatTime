@@ -39,14 +39,34 @@ def parse_series(x):
     return np.asarray(x, dtype=np.float64)
 
 
-def chronological_split(df, train_ratio=0.6, val_ratio=0.2):
-    n = len(df)
-    train_end = int(n * train_ratio)
-    val_end = int(n * (train_ratio + val_ratio))
+def chronological_split(df, train_ratio=0.6, val_ratio=0.2, group_column="Idx"):
+    if group_column not in df.columns:
+        n = len(df)
+        train_end = int(n * train_ratio)
+        val_end = int(n * (train_ratio + val_ratio))
+        return (
+            df.iloc[:train_end].reset_index(drop=True),
+            df.iloc[train_end:val_end].reset_index(drop=True),
+            df.iloc[val_end:].reset_index(drop=True),
+        )
 
-    train_df = df.iloc[:train_end].reset_index(drop=True)
-    val_df = df.iloc[train_end:val_end].reset_index(drop=True)
-    test_df = df.iloc[val_end:].reset_index(drop=True)
+    train_parts = []
+    val_parts = []
+    test_parts = []
+
+    for _, group in df.groupby(group_column, sort=False):
+        group = group.sort_values("Date").reset_index(drop=True)
+        n = len(group)
+        train_end = int(n * train_ratio)
+        val_end = int(n * (train_ratio + val_ratio))
+
+        train_parts.append(group.iloc[:train_end])
+        val_parts.append(group.iloc[train_end:val_end])
+        test_parts.append(group.iloc[val_end:])
+
+    train_df = pd.concat(train_parts, ignore_index=True)
+    val_df = pd.concat(val_parts, ignore_index=True)
+    test_df = pd.concat(test_parts, ignore_index=True)
 
     return train_df, val_df, test_df
 
@@ -253,6 +273,12 @@ def debug_one_sample(model, row, hist_len, pred_len, train_mean, train_std, mode
     print("context:", mae_standardized(true_data, pred_ctx, train_mean, train_std))
     print("======================================\n")
 
+def reset_generation_seed(seed):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 def build_model_configs(args):
     configs = []
@@ -325,7 +351,7 @@ def main():
 
     parser.add_argument("--hist_lengths", type=str, default="48,72,96,120")
     parser.add_argument("--pred_len", type=int, default=24)
-    parser.add_argument("--max_eval_windows", type=int, default=100)
+    parser.add_argument("--max_eval_windows", type=int, default=10)
 
     parser.add_argument("--num_samples", type=int, default=8)
     parser.add_argument("--max_pred_len", type=int, default=16)
@@ -338,9 +364,10 @@ def main():
     parser.add_argument("--chattime_model_path", type=str, default="ChengsenWang/ChatTime-1-7B-Chat")
 
     parser.add_argument("--mamba_base", action="store_true")
-    parser.add_argument("--mamba_base_model_path", type=str, default="state-spaces/mamba-370m-hf")
+    parser.add_argument("--mamba_base_model_path", type=str, default="state-spaces/mamba-2.8b-hf")
     parser.add_argument("--mamba_pretrain_adapter", type=str, default=None)
     parser.add_argument("--mamba_finetune_adapter", type=str, default=None)
+    parser.add_argument("--random_seed", type=int, default=3407)
 
     parser.add_argument("--save_predictions", action="store_true")
     parser.add_argument("--debug_first_sample", action="store_true")
@@ -401,7 +428,15 @@ def main():
     print("Train shape:", train_df.shape)
     print("Val shape:", val_df.shape)
     print("Test shape:", test_df.shape)
+    print("Train date range:", train_df["Date"].min(), train_df["Date"].max())
+    print("Validation date range:", val_df["Date"].min(), val_df["Date"].max())
+    print("Test date range:", test_df["Date"].min(), test_df["Date"].max())
 
+    if "Idx" in df.columns:
+        print("All series:", df["Idx"].nunique())
+        print("Train series:", train_df["Idx"].nunique())
+        print("Validation series:", val_df["Idx"].nunique())
+        print("Test series:", test_df["Idx"].nunique())
     # =========================
     # 4. Train statistics
     # =========================

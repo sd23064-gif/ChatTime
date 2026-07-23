@@ -9,6 +9,8 @@ from peft import PeftModel
 
 from utils.prompt import getPrompt
 from utils.tools import Discretizer, Serializer
+import time
+
 
 
 class ChatTimeMamba:
@@ -20,9 +22,9 @@ class ChatTimeMamba:
         pred_len=None,
         max_pred_len=16,
         num_samples=8,
-        top_k=50,
-        top_p=0.9,
-        temperature=0.7,
+        top_k=100,
+        top_p=1,
+        temperature=1,
         torch_dtype=torch.float16,
         merge_lora=False,
     ):
@@ -71,7 +73,7 @@ class ChatTimeMamba:
             low_cpu_mem_usage=True,
             return_dict=True,
             torch_dtype=torch_dtype,
-            device_map="auto",
+            device_map={"": 0},
             trust_remote_code=True,
         )
 
@@ -117,11 +119,15 @@ class ChatTimeMamba:
             padding=False,
             truncation=False,
         )
-
-        inputs = {k: v.to(self._device()) for k, v in inputs.items()}
+        inputs = {key: value.to(self._device()) for key, value in inputs.items()}
         input_len = inputs["input_ids"].shape[-1]
 
-        with torch.no_grad():
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        start = time.perf_counter()
+
+        with torch.inference_mode():
             outputs = self.model.generate(
                 **inputs,
                 min_new_tokens=min_new_tokens,
@@ -133,20 +139,40 @@ class ChatTimeMamba:
                 temperature=self.temperature,
                 eos_token_id=self.eos_token_id,
                 pad_token_id=self.tokenizer.pad_token_id,
+                use_cache=True,
             )
 
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        elapsed = time.perf_counter() - start
+
+        generated_lengths = []
         generated_texts = []
 
         for output in outputs:
-            # prompt 部分を除いて、新規生成部分のみ decode
             generated_ids = output[input_len:]
-            text = self.tokenizer.decode(
-                generated_ids,
-                skip_special_tokens=True,
+            generated_lengths.append(int(generated_ids.numel()))
+            generated_texts.append(
+                self.tokenizer.decode(
+                    generated_ids,
+                    skip_special_tokens=True,
+                )
             )
-            generated_texts.append(text)
+
+        total_generated_tokens = sum(generated_lengths)
+
+        print({
+            "input_tokens": input_len,
+            "samples": self.num_samples,
+            "generated_lengths": generated_lengths,
+            "total_generated_tokens": total_generated_tokens,
+            "generate_seconds": elapsed,
+            "tokens_per_second": total_generated_tokens / max(elapsed, 1e-9),
+        })
 
         return generated_texts
+
 
     def _extract_response(self, text):
         """
@@ -159,18 +185,18 @@ class ChatTimeMamba:
         return text
 
     def _extract_numeric_tokens(self, text):
-        import re
         tokens = re.findall(
             r"###(?:[+-]?\d+(?:\.\d+)?|Nan|NaN|nan)###",
             text,
         )
+
         return " ".join(tokens)
 
     def predict(self, hist_data, context=None):
         if self.hist_len is None or self.pred_len is None:
             raise ValueError("hist_len and pred_len must be specified before prediction")
 
-        series = hist_data
+        series = np.asarray(hist_data, dtype=np.float64).copy()
         prediction_list = []
         remaining = self.pred_len
 
@@ -186,8 +212,8 @@ class ChatTimeMamba:
                 input=serialized_series,
             )
 
-            max_new_tokens = 6 * current_pred_len + 32
-            min_new_tokens = current_pred_len 
+            min_new_tokens = current_pred_len
+            max_new_tokens = current_pred_len + 8
 
             samples = self._generate_texts(
                 prompt,
@@ -195,24 +221,23 @@ class ChatTimeMamba:
                 max_new_tokens=max_new_tokens,
             )
 
-
             pred_list = []
             parse_errors = 0
 
             for sample in samples:
                 try:
                     serialized_prediction = self._extract_response(sample)
-                    serialized_prediction = self._extract_numeric_tokens(serialized_prediction)
+                    serialized_prediction = self._extract_numeric_tokens(
+                        serialized_prediction
+                    )
 
                     dispersed_prediction = self.serializer.inverse_serialize(
                         serialized_prediction
                     )
-
                     pred = self.discretizer.inverse_discretize(
                         dispersed_prediction
                     )
-
-                    pred = np.asarray(pred, dtype=np.float64)
+                    pred = np.asarray(pred, dtype=np.float64).reshape(-1)
 
                     if len(pred) == 0:
                         raise ValueError(
@@ -220,27 +245,27 @@ class ChatTimeMamba:
                         )
 
                     if len(pred) < current_pred_len:
-                        pred = np.concatenate(
-                            [
-                                pred,
-                                np.full(current_pred_len - len(pred), np.nan),
-                            ]
-                        )
+                        pred = np.concatenate([
+                            pred,
+                            np.full(
+                                current_pred_len - len(pred),
+                                np.nan,
+                                dtype=np.float64,
+                            ),
+                        ])
 
                     pred_list.append(pred[:current_pred_len])
 
-                except Exception as e:
+                except Exception as error:
                     parse_errors += 1
-                    print(f"Failed to parse prediction sample: {e}")
+                    print(f"Failed to parse prediction sample: {error}")
                     print("Raw sample head:", repr(sample[:300]))
-                    continue
 
             if len(pred_list) == 0:
                 print(
-                    f"[Warning] All prediction samples failed to parse. "
+                    "[Warning] All prediction samples failed to parse. "
                     f"Using last-value fallback. current_pred_len={current_pred_len}"
                 )
-
                 prediction = np.full(
                     current_pred_len,
                     series[-1],
@@ -249,9 +274,15 @@ class ChatTimeMamba:
             else:
                 pred_arr = np.asarray(pred_list, dtype=np.float64)
 
+                if pred_arr.ndim != 2 or pred_arr.shape[1] != current_pred_len:
+                    raise ValueError(
+                        f"Unexpected prediction array shape: {pred_arr.shape}, "
+                        f"expected=({len(pred_list)}, {current_pred_len})"
+                    )
+
                 if np.isnan(pred_arr).all():
                     print(
-                        f"[Warning] All parsed predictions are NaN. "
+                        "[Warning] All parsed predictions are NaN. "
                         f"Using last-value fallback. current_pred_len={current_pred_len}"
                     )
                     prediction = np.full(
@@ -260,9 +291,14 @@ class ChatTimeMamba:
                         dtype=np.float64,
                     )
                 else:
-                    prediction = np.nanmedian(pred_arr, axis=0)
+                    with np.errstate(all="ignore"):
+                        prediction = np.nanmedian(pred_arr, axis=0)
 
-                    # 部分的に NaN が残る場合は last value で埋める
+                    prediction = np.asarray(
+                        prediction,
+                        dtype=np.float64,
+                    ).reshape(-1)
+
                     if np.isnan(prediction).any():
                         prediction = np.where(
                             np.isnan(prediction),
@@ -270,19 +306,52 @@ class ChatTimeMamba:
                             prediction,
                         )
 
-            prediction = np.nanmedian(pred_list, axis=0)
+            prediction = np.asarray(
+                prediction,
+                dtype=np.float64,
+            ).reshape(-1)
 
+            if len(prediction) != current_pred_len:
+                raise ValueError(
+                    "Final chunk length mismatch: "
+                    f"actual={len(prediction)}, expected={current_pred_len}"
+                )
+
+            if not np.isfinite(prediction).all():
+                print(
+                    "[Warning] Non-finite predictions remained after aggregation. "
+                    "Replacing them with the last observed value."
+                )
+                prediction = np.where(
+                    np.isfinite(prediction),
+                    prediction,
+                    series[-1],
+                )
+            print({
+                "generated_samples": len(samples),
+                "parsed_samples": len(pred_list),
+                "parse_errors": parse_errors,
+                "prediction_length": len(prediction),
+                "prediction_nan_count": int(np.isnan(prediction).sum()),
+            })
             prediction_list.append(prediction)
-            remaining -= prediction.shape[-1]
+            remaining -= current_pred_len
 
             if remaining <= 0:
                 break
 
             series = np.concatenate([series, prediction], axis=-1)
 
-        prediction = np.concatenate(prediction_list, axis=-1)
+        final_prediction = np.concatenate(prediction_list, axis=-1)
+        final_prediction = final_prediction[:self.pred_len]
 
-        return prediction
+        if len(final_prediction) != self.pred_len:
+            raise ValueError(
+                "Final prediction length mismatch: "
+                f"actual={len(final_prediction)}, expected={self.pred_len}"
+            )
+
+        return final_prediction
 
     def analyze(self, question, series):
         dispersed_series = self.discretizer.discretize(series)
@@ -321,3 +390,4 @@ class ChatTimeMamba:
         response = Counter(response_list).most_common(1)[0][0]
 
         return response
+    

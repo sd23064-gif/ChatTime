@@ -8,6 +8,7 @@ import argparse
 import json
 from model.model import ChatTime
 from model.mamba_model import ChatTimeMamba
+import time
 
 np.NaN = np.nan
 
@@ -153,7 +154,7 @@ def main():
     dataset_name = args.dataset_name
 
     pred_len = 24
-    hist_lengths = [48, 72]
+    hist_lengths = [48]
 
     max_eval_windows = args.max_eval_windows
     if max_eval_windows < 0:
@@ -169,26 +170,15 @@ def main():
             "type": "naive_last",
         },
         {
-            "name": "chattime_7b",
-            "type": "chattime",
-            "model_path": "ChengsenWang/ChatTime-1-7B-Chat",
-        },
-        {
             "name": "mamba_pretrain_2.8b",
             "type": "mamba",
             "base_model_path": "state-spaces/mamba-2.8b-hf",
-            "adapter_path": "outputs/model/mamba-2.8b-time",
+            "adapter_path": "outputs/logs/mamba-2.8b-pretrain-r/checkpoint-4000",
+            "max_pred_len": 24,
             "num_samples": 8,
-        },
-        {
-            "name": "mamba_finetuned_2.8b",
-            "type": "mamba",
-            "base_model_path": "state-spaces/mamba-2.8b-hf",
-            "adapter_path": "outputs/model/finetune-mamba-2.8b-time-finetune",
-            "num_samples": 8,
-        },
+            "merge_lora": False,
+        }
     ]
-
     # =========================
     # 1. Load dataset
     # =========================
@@ -237,11 +227,19 @@ def main():
         for hist_len in hist_lengths:
             print(f"\nModel={model_name}, hist_len={hist_len}, pred_len={pred_len}")
 
+            load_start = time.perf_counter()
+
             model = load_eval_model(
                 config=config,
                 hist_len=hist_len,
                 pred_len=pred_len,
             )
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+
+            load_seconds = time.perf_counter() - load_start
+            print(f"Model load time: {load_seconds:.2f} seconds")
 
             for col in tqdm(selected_columns, desc=f"{model_name}, hist_len={hist_len}"):
                 series = value_df_std[col].to_numpy(dtype=np.float64)
@@ -273,9 +271,24 @@ def main():
                         continue
 
                     try:
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+
+                        predict_start = time.perf_counter()
+
                         pred_data = model.predict(hist_data)
 
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+
+                        predict_seconds = time.perf_counter() - predict_start
                         pred_data = np.asarray(pred_data, dtype=np.float64)
+
+                        print(
+                            f"Prediction time: model={model_name}, col={col}, "
+                            f"hist_len={hist_len}, start={start}, "
+                            f"seconds={predict_seconds:.3f}"
+                        )
 
                         if len(pred_data) != len(true_data):
                             print(
@@ -306,11 +319,12 @@ def main():
                             "hist_len": hist_len,
                             "pred_len": pred_len,
                             "start_index": start,
-
+                            "num_samples": config.get("num_samples", 1),
+                            "inference_seconds": predict_seconds,
+                            "seconds_per_predicted_point": predict_seconds / pred_len,
                             "mae_std": mae_std,
                             "rmse_std": rmse_std,
                             "smape_std": smape_std,
-
                             "mae_raw": mae_raw,
                             "rmse_raw": rmse_raw,
                             "smape_raw": smape_raw,
@@ -326,14 +340,14 @@ def main():
 
             # 途中保存
             tmp_df = pd.DataFrame(all_results)
-            tmp_df.to_csv("outputs/model_comparison_etth2_mae_details_tmp.csv", index=False)
-
+            tmp_path = os.path.join(output_dir, "model_comparison_etth2_mae_details_tmp.csv")
+            tmp_df.to_csv(tmp_path, index=False)
     # =========================
     # 4. Save detailed results
     # =========================
     result_df = pd.DataFrame(all_results)
 
-    detail_path = "outputs/model_comparison_etth2_mae_details.csv"
+    detail_path = os.path.join(output_dir, "model_comparison_etth2_mae_details.csv")
     result_df.to_csv(detail_path, index=False)
 
     if len(result_df) == 0:
@@ -361,7 +375,7 @@ def main():
         )
     )
 
-    summary_path = "outputs/mamba_2.8b_analyze/model_comparison_etth2_mae_summary.csv"
+    summary_path = os.path.join(output_dir, "model_comparison_etth2_mae_summary.csv")
     summary_df.to_csv(summary_path, index=False)
 
     # =========================
@@ -385,7 +399,7 @@ def main():
         )
     )
 
-    summary_col_path = "outputs/mamba_2.8b_analyze/model_comparison_etth2_mae_summary_by_column.csv"
+    summary_col_path = os.path.join(output_dir, "model_comparison_etth2_mae_summary_by_column.csv")
     summary_col_df.to_csv(summary_col_path, index=False)
 
     # =========================
@@ -420,7 +434,7 @@ def main():
         )
     else:
         ranking_df["mae_std_improvement_vs_normal_mamba_pct"] = np.nan
-    ranking_path = "outputs/model_comparison_etth2_mae_ranking.csv"
+    ranking_path = os.path.join(output_dir, "model_comparison_etth2_mae_ranking.csv")
     ranking_df.to_csv(ranking_path, index=False)
     import json
 
@@ -433,7 +447,9 @@ def main():
         "models": model_configs,
     }
 
-    with open("outputs/model_comparison_etth2_eval_config.json", "w", encoding="utf-8") as f:
+    eval_config_path = os.path.join(output_dir, "model_comparison_etth2_eval_config.json")
+
+    with open(eval_config_path, "w", encoding="utf-8") as f:
         json.dump(eval_config, f, ensure_ascii=False, indent=2)
         print("\nSummary")
     print(summary_df)
@@ -446,6 +462,7 @@ def main():
     print(" -", summary_path)
     print(" -", summary_col_path)
     print(" -", ranking_path)
+    print(" -", eval_config_path)
 
 
 if __name__ == "__main__":

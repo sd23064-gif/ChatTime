@@ -4,7 +4,7 @@ import pandas as pd
 from tqdm import tqdm
 import gc
 import torch
-
+import argparse
 from model.model import ChatTime
 
 np.NaN = np.nan
@@ -28,8 +28,16 @@ def chronological_split(df, train_ratio=0.6, val_ratio=0.2):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--base_model_path", type=str, required=True)
+    parser.add_argument("--adapter_path", type=str, default=None)
+    parser.add_argument("--output_path", type=str, default="outputs/zero/test")
+
+    args = parser.parse_args()
+
     dataset_path = "./dataset/ETTh2.csv"
-    model_path = "ChengsenWang/ChatTime-1-7B-Chat"
+    base_model_path = args.base_model_path
+    adapter_path = args.adapter_path
 
     dataset_name = "ETTh2"
     pred_len = 24
@@ -79,11 +87,18 @@ def main():
     for hist_len in hist_lengths:
         print(f"\nEvaluating hist_len={hist_len}, pred_len={pred_len}")
 
+        base_model_path = "ベースモデルのパス"
+        adapter_path = "./llama-3.2-3b"
+
         model = ChatTime(
+            base_model_path=base_model_path,
+            adapter_path=adapter_path,
+            tokenizer_path=adapter_path,
+            merge_adapter=False,
             hist_len=hist_len,
-            pred_len=pred_len,
-            model_path=model_path
-        )
+            pred_len=pred_len
+)
+
 
         for col in tqdm(selected_columns, desc=f"hist_len={hist_len}"):
             series = value_df_std[col].to_numpy(dtype=np.float64)

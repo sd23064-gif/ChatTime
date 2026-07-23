@@ -3,6 +3,7 @@ import sys
 import re
 import numpy as np
 import torch
+import pandas as pd
 from datasets import load_dataset
 # 【変更前】
 # from transformers import TrainingArguments, LlamaTokenizer
@@ -17,131 +18,242 @@ NUMERIC_TOKEN_RE = re.compile(
     r"###([+-]?(?:\d+(?:\.\d*)?|\.\d+)|Nan|NaN|nan)###"
 )
 
-class NumericEmbeddingRegularizedSFTTrainer(SFTTrainer):
+class NumericLandmarkRegularizedSFTTrainer(SFTTrainer):
     def __init__(
         self,
         *args,
         numeric_token_ids=None,
         numeric_token_values=None,
-        embedding_reg_weight=0.001,
-        embedding_reg_pair_batch_size=1024,
-        embedding_reg_close_delta=0.002,
-        embedding_reg_far_delta=0.5,
-        embedding_reg_close_margin=0.05,
-        embedding_reg_far_margin=0.5,
-        regularize_lm_head=False,
+        landmark_token_ids=None,
+        landmark_token_values=None,
+        landmark_reg_weight=0.01,
+        positive_max_delta=0.01,
+        negative_min_delta=0.1,
+        triplet_margin=0.1,
+        negative_candidate_count=64,
+        landmark_pair_batch_size=1024,
+        detach_landmarks=True,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
 
-        if numeric_token_ids is None or numeric_token_values is None:
-            raise ValueError("numeric_token_ids and numeric_token_values are required.")
+        required = [
+            numeric_token_ids,
+            numeric_token_values,
+            landmark_token_ids,
+            landmark_token_values,
+        ]
 
-        self.numeric_token_ids_cpu = numeric_token_ids.detach().cpu().long()
-        self.numeric_token_values_cpu = numeric_token_values.detach().cpu().float()
-
-        self.embedding_reg_weight = embedding_reg_weight
-        self.embedding_reg_pair_batch_size = embedding_reg_pair_batch_size
-
-        self.embedding_reg_close_delta = embedding_reg_close_delta
-        self.embedding_reg_far_delta = embedding_reg_far_delta
-
-        self.embedding_reg_close_margin = embedding_reg_close_margin
-        self.embedding_reg_far_margin = embedding_reg_far_margin
-
-        self.regularize_lm_head = regularize_lm_head
-
-    def _sample_pairs(self, device):
-        values = self.numeric_token_values_cpu.to(device)
-        n = values.numel()
-        m = self.embedding_reg_pair_batch_size
-
-        anchors = torch.randint(0, n, (m,), device=device)
-
-        # 数値tokenはほぼ等間隔なので、値差を index step に変換する
-        step = torch.median(torch.diff(values)).abs().clamp(min=1e-8)
-        close_steps = max(1, int(round(self.embedding_reg_close_delta / step.item())))
-
-        offsets = torch.randint(1, close_steps + 1, (m,), device=device)
-        signs = torch.randint(0, 2, (m,), device=device) * 2 - 1
-
-        positives = anchors + signs * offsets
-        positives = torch.clamp(positives, 0, n - 1)
-
-        same = positives == anchors
-        positives = torch.where(
-            same & (anchors < n - 1),
-            anchors + 1,
-            positives,
-        )
-        positives = torch.where(
-            same & (anchors >= n - 1),
-            anchors - 1,
-            positives,
-        )
-
-        # far pair
-        negatives = torch.randint(0, n, (m,), device=device)
-
-        for _ in range(10):
-            bad = (values[anchors] - values[negatives]).abs() < self.embedding_reg_far_delta
-            if not bad.any():
-                break
-            negatives[bad] = torch.randint(0, n, (bad.sum().item(),), device=device)
-
-        bad = (values[anchors] - values[negatives]).abs() < self.embedding_reg_far_delta
-        if bad.any():
-            farthest = torch.where(
-                anchors < n // 2,
-                torch.full_like(anchors, n - 1),
-                torch.zeros_like(anchors),
+        if any(item is None for item in required):
+            raise ValueError(
+                "Numeric token ids/values and landmark ids/values "
+                "are required."
             )
-            negatives = torch.where(bad, farthest, negatives)
 
-        return anchors, positives, negatives
+        self.numeric_token_ids_cpu = (
+            numeric_token_ids.detach().cpu().long()
+        )
+        self.numeric_token_values_cpu = (
+            numeric_token_values.detach().cpu().float()
+        )
 
-    def _regularize_matrix(self, weight_matrix):
+        self.landmark_token_ids_cpu = (
+            landmark_token_ids.detach().cpu().long()
+        )
+        self.landmark_token_values_cpu = (
+            landmark_token_values.detach().cpu().float()
+        )
+
+        self.landmark_reg_weight = landmark_reg_weight
+        self.positive_max_delta = positive_max_delta
+        self.negative_min_delta = negative_min_delta
+        self.triplet_margin = triplet_margin
+        self.negative_candidate_count = negative_candidate_count
+        self.landmark_pair_batch_size = landmark_pair_batch_size
+        self.detach_landmarks = detach_landmarks
+
+        self._last_logged_global_step = -1
+
+    def _sample_landmark_triplets(self, weight_matrix):
         device = weight_matrix.device
 
         numeric_ids = self.numeric_token_ids_cpu.to(device)
+        numeric_values = self.numeric_token_values_cpu.to(device)
 
-        emb = weight_matrix[numeric_ids]
-        emb = F.normalize(emb.float(), dim=-1)
+        landmark_ids = self.landmark_token_ids_cpu.to(device)
+        landmark_values = self.landmark_token_values_cpu.to(device)
 
-        anchors, positives, negatives = self._sample_pairs(device)
+        numeric_emb = F.normalize(
+            weight_matrix[numeric_ids].float(),
+            dim=-1,
+        )
 
-        anchor_emb = emb[anchors]
-        pos_emb = emb[positives]
-        neg_emb = emb[negatives]
+        landmark_emb = F.normalize(
+            weight_matrix[landmark_ids].float(),
+            dim=-1,
+        )
 
-        pos_sim = (anchor_emb * pos_emb).sum(dim=-1)
-        neg_sim = (anchor_emb * neg_emb).sum(dim=-1)
+        n_numeric = numeric_ids.numel()
+        batch_size = min(
+            self.landmark_pair_batch_size,
+            n_numeric,
+        )
 
-        pos_dist = 1.0 - pos_sim
-        neg_dist = 1.0 - neg_sim
+        anchor_indices = torch.randint(
+            0,
+            n_numeric,
+            (batch_size,),
+            device=device,
+        )
 
-        close_loss = F.relu(
-            pos_dist - self.embedding_reg_close_margin
-        ).pow(2).mean()
+        anchor_values = numeric_values[anchor_indices]
+        anchor_emb = numeric_emb[anchor_indices]
 
-        far_loss = F.relu(
-            self.embedding_reg_far_margin - neg_dist
-        ).pow(2).mean()
+        # ----------------------------------------------------
+        # Positive:
+        # 数値的に最も近いlandmarkを選ぶ
+        # ----------------------------------------------------
+        value_diff = torch.abs(
+            anchor_values[:, None] - landmark_values[None, :]
+        )
 
-        return close_loss + far_loss
+        positive_diff, positive_indices = value_diff.min(dim=1)
 
-    def numeric_embedding_regularization_loss(self, model):
-        input_emb = model.get_input_embeddings().weight
-        reg_loss = self._regularize_matrix(input_emb)
+        valid_positive = (
+            positive_diff <= self.positive_max_delta
+        )
 
-        if self.regularize_lm_head:
-            output_emb = model.get_output_embeddings()
-            if output_emb is not None and hasattr(output_emb, "weight"):
-                reg_loss = reg_loss + self._regularize_matrix(output_emb.weight)
+        # ----------------------------------------------------
+        # Hard-negative candidates:
+        # 数値差がnegative_min_delta以上のlandmarkから
+        # ランダム候補を抽出し、その中で最も類似するものを選ぶ
+        # ----------------------------------------------------
+        n_landmarks = landmark_ids.numel()
+        candidate_count = min(
+            self.negative_candidate_count,
+            n_landmarks,
+        )
 
-        return reg_loss
+        random_candidates = torch.randint(
+            0,
+            n_landmarks,
+            (batch_size, candidate_count),
+            device=device,
+        )
 
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        candidate_values = landmark_values[random_candidates]
+
+        far_mask = (
+            torch.abs(
+                anchor_values[:, None] - candidate_values
+            )
+            >= self.negative_min_delta
+        )
+
+        candidate_emb = landmark_emb[random_candidates]
+
+        similarities = torch.einsum(
+            "bd,bkd->bk",
+            anchor_emb,
+            candidate_emb,
+        )
+
+        similarities = similarities.masked_fill(
+            ~far_mask,
+            -float("inf"),
+        )
+
+        negative_similarity, best_candidate_position = (
+            similarities.max(dim=1)
+        )
+
+        has_valid_negative = torch.isfinite(
+            negative_similarity
+        )
+
+        row_indices = torch.arange(
+            batch_size,
+            device=device,
+        )
+
+        negative_indices = random_candidates[
+            row_indices,
+            best_candidate_position,
+        ]
+
+        valid = valid_positive & has_valid_negative
+
+        return (
+            anchor_emb[valid],
+            landmark_emb[positive_indices[valid]],
+            landmark_emb[negative_indices[valid]],
+            positive_diff[valid],
+            negative_similarity[valid],
+        )
+
+    def numeric_landmark_loss(self, model):
+        weight_matrix = model.get_input_embeddings().weight
+
+        (
+            anchor_emb,
+            positive_emb,
+            negative_emb,
+            positive_value_diff,
+            negative_similarity,
+        ) = self._sample_landmark_triplets(weight_matrix)
+
+        if anchor_emb.shape[0] == 0:
+            zero = weight_matrix.sum() * 0.0
+
+            return zero, {
+                "valid_triplets": 0,
+                "positive_value_diff_mean": 0.0,
+                "hard_negative_similarity_mean": 0.0,
+            }
+
+        if self.detach_landmarks:
+            positive_emb = positive_emb.detach()
+            negative_emb = negative_emb.detach()
+
+        positive_distance = 1.0 - (
+            anchor_emb * positive_emb
+        ).sum(dim=-1)
+
+        negative_distance = 1.0 - (
+            anchor_emb * negative_emb
+        ).sum(dim=-1)
+
+        triplet_loss = F.relu(
+            positive_distance
+            - negative_distance
+            + self.triplet_margin
+        ).mean()
+
+        metrics = {
+            "valid_triplets": int(anchor_emb.shape[0]),
+            "positive_value_diff_mean": (
+                positive_value_diff.detach().mean().item()
+            ),
+            "hard_negative_similarity_mean": (
+                negative_similarity.detach().mean().item()
+            ),
+            "positive_distance_mean": (
+                positive_distance.detach().mean().item()
+            ),
+            "negative_distance_mean": (
+                negative_distance.detach().mean().item()
+            ),
+        }
+
+        return triplet_loss, metrics
+
+    def compute_loss(
+        self,
+        model,
+        inputs,
+        return_outputs=False,
+        **kwargs,
+    ):
         outputs = model(**inputs)
 
         if isinstance(outputs, dict):
@@ -149,22 +261,142 @@ class NumericEmbeddingRegularizedSFTTrainer(SFTTrainer):
         else:
             lm_loss = outputs[0]
 
-        if self.embedding_reg_weight > 0:
-            emb_reg_loss = self.numeric_embedding_regularization_loss(model)
-            loss = lm_loss + self.embedding_reg_weight * emb_reg_loss
+        if self.landmark_reg_weight > 0:
+            landmark_loss, landmark_metrics = (
+                self.numeric_landmark_loss(model)
+            )
+
+            weighted_landmark_loss = (
+                self.landmark_reg_weight
+                * landmark_loss
+            )
+
+            loss = lm_loss + weighted_landmark_loss
         else:
-            emb_reg_loss = torch.tensor(0.0, device=lm_loss.device)
+            landmark_loss = torch.zeros(
+                (),
+                device=lm_loss.device,
+            )
+
+            weighted_landmark_loss = torch.zeros(
+                (),
+                device=lm_loss.device,
+            )
+
+            landmark_metrics = {
+                "valid_triplets": 0,
+                "positive_value_diff_mean": 0.0,
+                "hard_negative_similarity_mean": 0.0,
+                "positive_distance_mean": 0.0,
+                "negative_distance_mean": 0.0,
+            }
+
             loss = lm_loss
 
-        # log
-        if self.state.global_step % max(1, self.args.logging_steps) == 0:
-            self.log({
-                "lm_loss": lm_loss.detach().float().item(),
-                "numeric_embedding_reg_loss": emb_reg_loss.detach().float().item(),
-                "total_loss_with_numeric_reg": loss.detach().float().item(),
-            })
+        current_step = int(self.state.global_step)
 
-        return (loss, outputs) if return_outputs else loss
+        if (
+            current_step > 0
+            and current_step
+            % max(1, self.args.logging_steps)
+            == 0
+            and current_step
+            != self._last_logged_global_step
+        ):
+            self.log(
+                {
+                    "lm_loss": (
+                        lm_loss.detach().float().item()
+                    ),
+                    "landmark_triplet_loss": (
+                        landmark_loss
+                        .detach()
+                        .float()
+                        .item()
+                    ),
+                    "weighted_landmark_loss": (
+                        weighted_landmark_loss
+                        .detach()
+                        .float()
+                        .item()
+                    ),
+                    "total_loss_with_landmark_reg": (
+                        loss.detach().float().item()
+                    ),
+                    **landmark_metrics,
+                }
+            )
+
+            self._last_logged_global_step = (
+                current_step
+            )
+
+        if return_outputs:
+            return loss, outputs
+
+        return loss
+
+def load_landmark_tensors(landmark_csv,tokenizer):
+    landmark_df = pd.read_csv(landmark_csv)
+
+    if "query_token" in landmark_df.columns:
+        token_column = "query_token"
+    elif "token" in landmark_df.columns:
+        token_column = "token"
+    else:
+        raise ValueError(
+            "Landmark CSV needs query_token or token column."
+        )
+
+    if "query_value" in landmark_df.columns:
+        value_column = "query_value"
+    elif "value" in landmark_df.columns:
+        value_column = "value"
+    else:
+        raise ValueError(
+            "Landmark CSV needs query_value or value column."
+        )
+
+    tokens = landmark_df[token_column].astype(str).tolist()
+
+    token_ids = tokenizer.convert_tokens_to_ids(tokens)
+
+    valid_rows = []
+
+    for token, token_id, value in zip(
+        tokens,
+        token_ids,
+        landmark_df[value_column].tolist(),
+    ):
+        if token_id is None or token_id < 0:
+            continue
+
+        valid_rows.append(
+            {
+                "token": token,
+                "token_id": int(token_id),
+                "value": float(value),
+            }
+        )
+
+    landmark_token_ids = torch.tensor(
+        [row["token_id"] for row in valid_rows],
+        dtype=torch.long,
+    )
+
+    landmark_token_values = torch.tensor(
+        [row["value"] for row in valid_rows],
+        dtype=torch.float32,
+    )
+
+    print("landmark token count:", len(valid_rows))
+    print(
+        "landmark value range:",
+        landmark_token_values.min().item(),
+        landmark_token_values.max().item(),
+    )
+
+    return landmark_token_ids, landmark_token_values
 def collect_numeric_token_ids_and_values(tokenizer):
     rows = []
 
@@ -335,6 +567,52 @@ if __name__ == "__main__":
 
     parser.add_argument("--regularize_lm_head", action="store_true", default=False)
     parser.add_argument("--wandb_run_name", type=str, default=None)
+    parser.add_argument(
+        "--landmark_csv",
+        type=str,
+        required=True,
+    )
+
+    parser.add_argument(
+        "--landmark_reg_weight",
+        type=float,
+        default=0.01,
+    )
+
+    parser.add_argument(
+        "--positive_max_delta",
+        type=float,
+        default=0.01,
+    )
+
+    parser.add_argument(
+        "--negative_min_delta",
+        type=float,
+        default=0.1,
+    )
+
+    parser.add_argument(
+        "--triplet_margin",
+        type=float,
+        default=0.1,
+    )
+
+    parser.add_argument(
+        "--negative_candidate_count",
+        type=int,
+        default=64,
+    )
+
+    parser.add_argument(
+        "--landmark_pair_batch_size",
+        type=int,
+        default=1024,
+    )
+
+    parser.add_argument(
+        "--detach_landmarks",
+        action="store_true",
+    )
     args = parser.parse_args()
 
     sys.path.append(args.code_path)
@@ -440,11 +718,10 @@ if __name__ == "__main__":
     print(f"Dataset example: \n{dataset[0]['text']}\n")
 
     # train model
-    trainer = NumericEmbeddingRegularizedSFTTrainer(
+    trainer = NumericLandmarkRegularizedSFTTrainer(
         model=model,
         tokenizer=tokenizer,
         train_dataset=dataset,
-        #eval_dataset=eval_dataset,
         dataset_text_field="text",
         max_seq_length=args.max_seq_length,
         packing=False,
@@ -452,13 +729,16 @@ if __name__ == "__main__":
         numeric_token_ids=numeric_token_ids,
         numeric_token_values=numeric_token_values,
 
-        embedding_reg_weight=args.embedding_reg_weight,
-        embedding_reg_pair_batch_size=args.embedding_reg_pair_batch_size,
-        embedding_reg_close_delta=args.embedding_reg_close_delta,
-        embedding_reg_far_delta=args.embedding_reg_far_delta,
-        embedding_reg_close_margin=args.embedding_reg_close_margin,
-        embedding_reg_far_margin=args.embedding_reg_far_margin,
-        regularize_lm_head=args.regularize_lm_head,
+        landmark_token_ids=landmark_token_ids,
+        landmark_token_values=landmark_token_values,
+
+        landmark_reg_weight=args.landmark_reg_weight,
+        positive_max_delta=args.positive_max_delta,
+        negative_min_delta=args.negative_min_delta,
+        triplet_margin=args.triplet_margin,
+        negative_candidate_count=args.negative_candidate_count,
+        landmark_pair_batch_size=args.landmark_pair_batch_size,
+        detach_landmarks=args.detach_landmarks,
         args=TrainingArguments(
             per_device_train_batch_size=args.per_device_train_batch_size,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
