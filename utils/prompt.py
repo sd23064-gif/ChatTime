@@ -22,31 +22,23 @@ PRE_INST_PROMPT_TEXT = (
 )
 
 ANA_INST_PROMPT_TEXT = (
-    "Please answer the following question carefully after analyzing the sequence: {}"
+    "Please answer the following question carefully after analyzing "
+    "the sequence: {}"
 )
 
 TEMPLATE = """{}
 
-#### Instruction:
-
+### Instruction:
 {}
 
-#### Input:
-
+### Input:
 {}
 
-#### Response:
-
+### Response:
 {}"""
 
 
-def getPrompt(
-    flag,
-    instruction=None,
-    input=None,
-    response=None,
-    context=None,
-):
+def getPrompt(flag, instruction=None, input=None, response=None, context=None):
     if flag == "general":
         system = GEN_SYS_PROMPT
 
@@ -55,8 +47,8 @@ def getPrompt(
                 "Instruction must be provided for general tasks."
             )
 
-        instruction_text = str(instruction).strip()
-        input_text = "" if input is None else str(input).strip()
+        instruction_text = str(instruction)
+        input_text = "" if input is None else str(input)
 
     elif flag == "prediction":
         system = PRE_SYS_PROMPT
@@ -66,13 +58,7 @@ def getPrompt(
                 "Input must be provided for prediction tasks."
             )
 
-        input_text = str(input).strip()
-
-        context_text = (
-            ""
-            if context is None
-            else str(context).strip()
-        )
+        context_text = "" if context is None else str(context).strip()
 
         if context_text:
             instruction_text = PRE_INST_PROMPT_TEXT.format(
@@ -80,6 +66,8 @@ def getPrompt(
             )
         else:
             instruction_text = PRE_INST_PROMPT
+
+        input_text = str(input)
 
     elif flag == "analysis":
         system = ANA_SYS_PROMPT
@@ -95,9 +83,9 @@ def getPrompt(
             )
 
         instruction_text = ANA_INST_PROMPT_TEXT.format(
-            str(instruction).strip()
+            str(instruction)
         )
-        input_text = str(input).strip()
+        input_text = str(input)
 
     else:
         raise ValueError(
@@ -105,11 +93,7 @@ def getPrompt(
             "'general', 'prediction', or 'analysis'."
         )
 
-    response_text = (
-        ""
-        if response is None
-        else str(response).strip()
-    )
+    response_text = "" if response is None else str(response)
 
     return TEMPLATE.format(
         system,
