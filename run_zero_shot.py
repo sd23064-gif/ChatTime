@@ -114,19 +114,57 @@ def build_model_configs(args):
 
 
 def load_eval_model(config, hist_len, pred_len, args):
-    common = dict(hist_len=hist_len, pred_len=pred_len, max_pred_len=args.max_pred_len,
-                  num_samples=args.num_samples, top_k=args.top_k,
-                  top_p=args.top_p, temperature=args.temperature)
-    if config["type"] == "llama":
-        tokenizer_path = config["adapter_path"] or config["base_model_path"]
-        return ChatTime(base_model_path=config["base_model_path"],
-                        adapter_path=config["adapter_path"], tokenizer_path=tokenizer_path,
-                        merge_adapter=args.merge_adapter, **common)
-    dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
-    return ChatTimeMamba(base_model_path=config["base_model_path"],
-                         adapter_path=config["adapter_path"], torch_dtype=dtype,
-                         merge_lora=args.merge_adapter, **common)
+    common = {
+        "hist_len": hist_len,
+        "pred_len": pred_len,
+        "max_pred_len": args.max_pred_len,
+        "num_samples": args.num_samples,
+        "top_k": args.top_k,
+        "top_p": args.top_p,
+        "temperature": args.temperature,
+    }
 
+    if config["type"] == "llama":
+        return ChatTime(
+            base_model_path=config["base_model_path"],
+            adapter_path=config["adapter_path"],
+            tokenizer_path=config["base_model_path"],
+            merge_adapter=args.merge_adapter,
+            hist_len=hist_len,
+            pred_len=pred_len,
+            max_pred_len=args.max_pred_len,
+            num_samples=args.num_samples,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            temperature=args.temperature,
+            debug_generation=False,
+            debug_samples=0,
+            verbose=False,
+        )
+
+    if config["type"] == "mamba":
+        torch_dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
+
+        return ChatTimeMamba(
+            base_model_path=config["base_model_path"],
+            adapter_path=config["adapter_path"],
+            tokenizer_path=config["base_model_path"],
+            hist_len=hist_len,
+            pred_len=pred_len,
+            max_pred_len=args.max_pred_len,
+            num_samples=args.num_samples,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            temperature=args.temperature,
+            torch_dtype=torch_dtype,
+            merge_lora=args.merge_adapter,
+            debug_generation=False,
+            debug_samples=0,
+            verbose=False,
+        )
+    raise ValueError(
+        f"Unsupported model type: {config['type']}"
+    )
 
 def safe_predict(model, hist_data, pred_len, seed):
     reset_seed(seed)
