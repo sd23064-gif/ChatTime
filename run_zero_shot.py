@@ -114,57 +114,36 @@ def build_model_configs(args):
 
 
 def load_eval_model(config, hist_len, pred_len, args):
-    common = {
-        "hist_len": hist_len,
-        "pred_len": pred_len,
-        "max_pred_len": args.max_pred_len,
-        "num_samples": args.num_samples,
-        "top_k": args.top_k,
-        "top_p": args.top_p,
-        "temperature": args.temperature,
-    }
-
+    common = dict(hist_len=hist_len, pred_len=pred_len, max_pred_len=args.max_pred_len,
+                  num_samples=args.num_samples, top_k=args.top_k,
+                  top_p=args.top_p, temperature=args.temperature)
     if config["type"] == "llama":
         return ChatTime(
             base_model_path=config["base_model_path"],
             adapter_path=config["adapter_path"],
             tokenizer_path=config["base_model_path"],
             merge_adapter=args.merge_adapter,
-            hist_len=hist_len,
-            pred_len=pred_len,
-            max_pred_len=args.max_pred_len,
-            num_samples=args.num_samples,
-            top_k=args.top_k,
-            top_p=args.top_p,
-            temperature=args.temperature,
             debug_generation=False,
             debug_samples=0,
-            verbose=False,
+            **common,
         )
 
     if config["type"] == "mamba":
-        torch_dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
-
+        dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
         return ChatTimeMamba(
             base_model_path=config["base_model_path"],
             adapter_path=config["adapter_path"],
             tokenizer_path=config["base_model_path"],
-            hist_len=hist_len,
-            pred_len=pred_len,
-            max_pred_len=args.max_pred_len,
-            num_samples=args.num_samples,
-            top_k=args.top_k,
-            top_p=args.top_p,
-            temperature=args.temperature,
-            torch_dtype=torch_dtype,
+            torch_dtype=dtype,
             merge_lora=args.merge_adapter,
             debug_generation=False,
             debug_samples=0,
             verbose=False,
+            **common,
         )
-    raise ValueError(
-        f"Unsupported model type: {config['type']}"
-    )
+
+    raise ValueError(f"Unknown model type: {config['type']}")
+
 
 def safe_predict(model, hist_data, pred_len, seed):
     reset_seed(seed)
@@ -308,26 +287,61 @@ def main():
                             for metric_name, metric_value in values.items():
                                 validate_nonnegative(metric_name, metric_value)
 
+                            parsed_ratio = stats.get("parsed_ratio", np.nan)
+                            fallback_ratio = stats.get("fallback_ratio", np.nan)
+                            generation_success = error is None and np.isfinite(pred_data).all()
+                            strict_success = (
+                                generation_success
+                                and np.isfinite(parsed_ratio)
+                                and parsed_ratio >= 1.0 - 1e-12
+                                and np.isfinite(fallback_ratio)
+                                and fallback_ratio <= 1e-12
+                            )
+
                             row = {
                                 "dataset": args.dataset_name, "model": config["name"], "column": column,
                                 "hist_len": hist_len, "pred_len": args.pred_len, "window_id": window_id,
                                 "sample_seed": sample_seed, "hist_start": hist_start,
                                 "pred_start": pred_start, "pred_end": pred_end,
-                                "success": error is None, **values,
+                                "generation_success": generation_success,
+                                "strict_success": strict_success,
+                                "success": strict_success,
+                                **values,
                                 "mae_improvement_vs_naive": values["naive_mae"] - values["mae"],
                                 "mae_change_vs_naive": values["mae"] - values["naive_mae"],
                                 "inference_seconds": elapsed,
-                                "parsed_ratio": stats.get("parsed_ratio", np.nan),
-                                "fallback_ratio": stats.get("fallback_ratio", np.nan),
-                                "parse_errors": stats.get("parse_errors", np.nan), "error": error,
+                                "parsed_ratio": parsed_ratio,
+                                "fallback_ratio": fallback_ratio,
+                                "parse_errors": stats.get("parse_errors", np.nan),
+                                "sample_std_mean": stats.get("sample_std_mean", np.nan),
+                                "sample_std_max": stats.get("sample_std_max", np.nan),
+                                "sample_range_mean": stats.get("sample_range_mean", np.nan),
+                                "sample_range_max": stats.get("sample_range_max", np.nan),
+                                "interval_width_50_mean": stats.get("interval_width_50_mean", np.nan),
+                                "interval_width_80_mean": stats.get("interval_width_80_mean", np.nan),
+                                "interval_width_80_max": stats.get("interval_width_80_max", np.nan),
+                                "error": error,
                             }
                             if args.date_column in raw_df.columns:
                                 row["prediction_start_date"] = raw_df.iloc[pred_start][args.date_column]
                             if args.save_predictions:
-                                row.update({"history": json.dumps(hist_data.tolist()),
-                                            "true": json.dumps(true_data.tolist()),
-                                            "prediction": json.dumps(pred_data.tolist()),
-                                            "naive_prediction": json.dumps(naive_data.tolist())})
+                                row.update({
+                                    "history": json.dumps(hist_data.tolist()),
+                                    "true": json.dumps(true_data.tolist()),
+                                    "prediction": json.dumps(pred_data.tolist()),
+                                    "naive_prediction": json.dumps(naive_data.tolist()),
+                                    "sample_std_per_position": json.dumps(
+                                        stats.get("sample_std_per_position", [])
+                                    ),
+                                    "sample_range_per_position": json.dumps(
+                                        stats.get("sample_range_per_position", [])
+                                    ),
+                                    "prediction_q10": json.dumps(stats.get("prediction_q10", [])),
+                                    "prediction_q25": json.dumps(stats.get("prediction_q25", [])),
+                                    "prediction_q50": json.dumps(stats.get("prediction_q50", [])),
+                                    "prediction_q75": json.dumps(stats.get("prediction_q75", [])),
+                                    "prediction_q90": json.dumps(stats.get("prediction_q90", [])),
+                                })
                             results.append(row)
                             progress.update(1)
 
@@ -351,7 +365,15 @@ def main():
         mae_improvement_vs_naive_mean=("mae_improvement_vs_naive", "mean"),
         model_better_than_naive_ratio=("mae_improvement_vs_naive", lambda x: float(np.mean(x > 0))),
         inference_seconds_mean=("inference_seconds", "mean"),
-        parsed_ratio_mean=("parsed_ratio", "mean"), fallback_ratio_mean=("fallback_ratio", "mean"),
+        parsed_ratio_mean=("parsed_ratio", "mean"),
+        fallback_ratio_mean=("fallback_ratio", "mean"),
+        sample_std_mean=("sample_std_mean", "mean"),
+        sample_std_max_mean=("sample_std_max", "mean"),
+        sample_range_mean=("sample_range_mean", "mean"),
+        sample_range_max_mean=("sample_range_max", "mean"),
+        interval_width_50_mean=("interval_width_50_mean", "mean"),
+        interval_width_80_mean=("interval_width_80_mean", "mean"),
+        interval_width_80_max_mean=("interval_width_80_max", "mean"),
         n_samples=("mae", "count"))
     summary_path = output_dir / "llama_mamba_etth2_summary.csv"
     summary.to_csv(summary_path, index=False)
