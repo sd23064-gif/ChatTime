@@ -205,6 +205,18 @@ class ChatTimeMamba:
             text,
         )
 
+    @staticmethod
+    def _finite_summary(values, operation):
+        values = np.asarray(values, dtype=np.float64)
+        finite = values[np.isfinite(values)]
+        if len(finite) == 0:
+            return np.nan
+        if operation == "mean":
+            return float(np.mean(finite))
+        if operation == "max":
+            return float(np.max(finite))
+        raise ValueError(f"Unsupported summary operation: {operation}")
+
     def _parse_prediction(self, sample, current_pred_len, sample_index):
         response = self._extract_response(sample)
         numeric_tokens = self._extract_numeric_tokens(response)
@@ -297,14 +309,38 @@ class ChatTimeMamba:
                         f"Unexpected prediction array shape: actual={prediction_array.shape}, "
                         f"expected={expected_shape}"
                     )
-                valid_counts = np.isfinite(prediction_array).sum(axis=0)
+
+                valid_mask = np.isfinite(prediction_array)
+                valid_counts = valid_mask.sum(axis=0)
+
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", category=RuntimeWarning)
                     prediction_before_fallback = np.nanmedian(prediction_array, axis=0)
+                    sample_std_per_position = np.nanstd(prediction_array, axis=0)
+                    sample_range_per_position = (
+                        np.nanmax(prediction_array, axis=0)
+                        - np.nanmin(prediction_array, axis=0)
+                    )
+                    prediction_q10 = np.nanquantile(prediction_array, 0.10, axis=0)
+                    prediction_q25 = np.nanquantile(prediction_array, 0.25, axis=0)
+                    prediction_q50 = np.nanquantile(prediction_array, 0.50, axis=0)
+                    prediction_q75 = np.nanquantile(prediction_array, 0.75, axis=0)
+                    prediction_q90 = np.nanquantile(prediction_array, 0.90, axis=0)
             else:
                 prediction_array = np.empty((0, current_pred_len), dtype=np.float64)
+                valid_mask = np.zeros((0, current_pred_len), dtype=bool)
                 valid_counts = np.zeros(current_pred_len, dtype=np.int64)
                 prediction_before_fallback = np.full(current_pred_len, np.nan, dtype=np.float64)
+                sample_std_per_position = np.full(current_pred_len, np.nan, dtype=np.float64)
+                sample_range_per_position = np.full(current_pred_len, np.nan, dtype=np.float64)
+                prediction_q10 = np.full(current_pred_len, np.nan, dtype=np.float64)
+                prediction_q25 = prediction_q10.copy()
+                prediction_q50 = prediction_q10.copy()
+                prediction_q75 = prediction_q10.copy()
+                prediction_q90 = prediction_q10.copy()
+
+            interval_width_50_per_position = prediction_q75 - prediction_q25
+            interval_width_80_per_position = prediction_q90 - prediction_q10
 
             fallback_mask = ~np.isfinite(prediction_before_fallback)
             prediction = np.asarray(prediction_before_fallback, dtype=np.float64).copy()
@@ -334,6 +370,20 @@ class ChatTimeMamba:
                 "fallback_count": int(fallback_mask.sum()),
                 "fallback_ratio": float(fallback_mask.mean()),
                 "valid_counts_per_position": valid_counts.tolist(),
+                "sample_std_mean": self._finite_summary(sample_std_per_position, "mean"),
+                "sample_std_max": self._finite_summary(sample_std_per_position, "max"),
+                "sample_range_mean": self._finite_summary(sample_range_per_position, "mean"),
+                "sample_range_max": self._finite_summary(sample_range_per_position, "max"),
+                "interval_width_50_mean": self._finite_summary(interval_width_50_per_position, "mean"),
+                "interval_width_80_mean": self._finite_summary(interval_width_80_per_position, "mean"),
+                "interval_width_80_max": self._finite_summary(interval_width_80_per_position, "max"),
+                "sample_std_per_position": sample_std_per_position.tolist(),
+                "sample_range_per_position": sample_range_per_position.tolist(),
+                "prediction_q10": prediction_q10.tolist(),
+                "prediction_q25": prediction_q25.tolist(),
+                "prediction_q50": prediction_q50.tolist(),
+                "prediction_q75": prediction_q75.tolist(),
+                "prediction_q90": prediction_q90.tolist(),
                 "sample_stats": sample_stats,
             }
             all_chunk_stats.append(chunk_stats)
@@ -359,6 +409,37 @@ class ChatTimeMamba:
         total_fallback = sum(chunk["fallback_count"] for chunk in all_chunk_stats)
         total_parse_errors = sum(chunk["parse_errors"] for chunk in all_chunk_stats)
 
+        all_sample_std = np.concatenate([
+            np.asarray(chunk["sample_std_per_position"], dtype=np.float64)
+            for chunk in all_chunk_stats
+        ])[:self.pred_len]
+        all_sample_range = np.concatenate([
+            np.asarray(chunk["sample_range_per_position"], dtype=np.float64)
+            for chunk in all_chunk_stats
+        ])[:self.pred_len]
+        all_prediction_q10 = np.concatenate([
+            np.asarray(chunk["prediction_q10"], dtype=np.float64)
+            for chunk in all_chunk_stats
+        ])[:self.pred_len]
+        all_prediction_q25 = np.concatenate([
+            np.asarray(chunk["prediction_q25"], dtype=np.float64)
+            for chunk in all_chunk_stats
+        ])[:self.pred_len]
+        all_prediction_q50 = np.concatenate([
+            np.asarray(chunk["prediction_q50"], dtype=np.float64)
+            for chunk in all_chunk_stats
+        ])[:self.pred_len]
+        all_prediction_q75 = np.concatenate([
+            np.asarray(chunk["prediction_q75"], dtype=np.float64)
+            for chunk in all_chunk_stats
+        ])[:self.pred_len]
+        all_prediction_q90 = np.concatenate([
+            np.asarray(chunk["prediction_q90"], dtype=np.float64)
+            for chunk in all_chunk_stats
+        ])[:self.pred_len]
+        all_interval_width_50 = all_prediction_q75 - all_prediction_q25
+        all_interval_width_80 = all_prediction_q90 - all_prediction_q10
+
         self.last_prediction_stats = {
             "chunks": all_chunk_stats,
             "prediction_length": int(len(final_prediction)),
@@ -367,6 +448,20 @@ class ChatTimeMamba:
             "fallback_ratio": float(total_fallback / self.pred_len) if self.pred_len else np.nan,
             "parse_errors": int(total_parse_errors),
             "prediction_nan_count": int(np.isnan(final_prediction).sum()),
+            "sample_std_mean": self._finite_summary(all_sample_std, "mean"),
+            "sample_std_max": self._finite_summary(all_sample_std, "max"),
+            "sample_range_mean": self._finite_summary(all_sample_range, "mean"),
+            "sample_range_max": self._finite_summary(all_sample_range, "max"),
+            "interval_width_50_mean": self._finite_summary(all_interval_width_50, "mean"),
+            "interval_width_80_mean": self._finite_summary(all_interval_width_80, "mean"),
+            "interval_width_80_max": self._finite_summary(all_interval_width_80, "max"),
+            "sample_std_per_position": all_sample_std.tolist(),
+            "sample_range_per_position": all_sample_range.tolist(),
+            "prediction_q10": all_prediction_q10.tolist(),
+            "prediction_q25": all_prediction_q25.tolist(),
+            "prediction_q50": all_prediction_q50.tolist(),
+            "prediction_q75": all_prediction_q75.tolist(),
+            "prediction_q90": all_prediction_q90.tolist(),
         }
         return final_prediction
 
