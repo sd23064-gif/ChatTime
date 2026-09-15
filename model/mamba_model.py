@@ -80,18 +80,47 @@ class ChatTimeMamba:
             local_files_only=local_files_only,
         )
 
-        model_type = getattr(base_model.config, "model_type", None)
-        if model_type not in {"mamba", "mamba2"}:
+        model_type = str(
+            getattr(base_model.config, "model_type", "")
+        ).lower()
+        class_name = base_model.__class__.__name__
+
+        supported_model_types = {
+            "mamba",
+            "mamba2",
+            "falcon_mamba",
+        }
+
+        supported_model_classes = {
+            "MambaForCausalLM",
+            "Mamba2ForCausalLM",
+            "FalconMambaForCausalLM",
+        }
+
+        if (
+            model_type not in supported_model_types
+            and class_name not in supported_model_classes
+        ):
             raise ValueError(
-                "ChatTimeMamba expected a Mamba model, but loaded "
-                f"model_type={model_type}, class={type(base_model).__name__}"
+                "ChatTimeMamba expected a supported Mamba-family model, "
+                f"but loaded model_type={model_type!r}, class={class_name}. "
+                f"Supported model types: {sorted(supported_model_types)}"
+            )
+
+        if self.verbose:
+            print(
+                "Loaded Mamba-family model: "
+                f"model_type={model_type}, class={class_name}"
             )
 
         tokenizer_size = len(self.tokenizer)
         embedding_size = base_model.get_input_embeddings().weight.shape[0]
         output_layer = base_model.get_output_embeddings()
-        output_size = output_layer.weight.shape[0] if output_layer is not None else None
-
+        output_size = (
+            output_layer.weight.shape[0]
+            if output_layer is not None
+            else None
+        )
         if adapter_path is None:
             if embedding_size != tokenizer_size:
                 raise ValueError(
@@ -384,6 +413,7 @@ class ChatTimeMamba:
                 "prediction_q50": prediction_q50.tolist(),
                 "prediction_q75": prediction_q75.tolist(),
                 "prediction_q90": prediction_q90.tolist(),
+                "parsed_predictions": prediction_array.tolist(),
                 "sample_stats": sample_stats,
             }
             all_chunk_stats.append(chunk_stats)

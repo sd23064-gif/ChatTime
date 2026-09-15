@@ -1,4 +1,3 @@
-
 import argparse
 import os
 import sys
@@ -140,6 +139,36 @@ def inspect_embedding_trainability(model):
                 "requires_grad=",
                 parameter.requires_grad,
             )
+def freeze_pretraining_only_modules(model):
+    """
+    ChatTime論文の図:
+      (b) Continuous Pre-Training : embed_tokens / lm_head も学習対象(🔥)
+      (c) Instruction Fine-Tuning : embed_tokens / lm_head は凍結(❄️)し、
+                                     Transformer層のLoRAのみ学習する
+
+    このスクリプトは「先ほどの事前学習」で保存したLoRA adapter
+    (= (b)の成果物。modules_to_saveでembed_tokens/lm_headがtrainableになっている)
+    を引き継いで (c) Instruction Fine-Tuning を行う想定のため、
+    ロード直後にembed_tokens / lm_headを明示的に凍結する。
+    """
+    frozen_tensor_count = 0
+    frozen_param_count = 0
+
+    for name, parameter in model.named_parameters():
+        lower_name = name.lower()
+
+        if "embed" in lower_name or "lm_head" in lower_name:
+            if parameter.requires_grad:
+                frozen_tensor_count += 1
+                frozen_param_count += parameter.numel()
+            parameter.requires_grad = False
+
+    print(
+        f"\n[Instruction Fine-Tuning] embed_tokens / lm_head を凍結しました: "
+        f"{frozen_tensor_count} 個のテンソル / {frozen_param_count:,} パラメータ"
+    )
+
+
 def verify_numeric_tokenization(tokenizer):
     check_tokens = [
         "###-0.9999###",
@@ -199,13 +228,33 @@ if __name__ == "__main__":
     parser.add_argument("--lora_rank", type=int, default=8)
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
+
+    # ChatTime論文の学習ステージ切り替え用フラグ。
+    #   True  (デフォルト): 図(c) Instruction Fine-Tuning
+    #                        embed_tokens / lm_head を凍結し、Transformer層のLoRAのみ学習
+    #   False              : 図(b) Continuous Pre-Training相当
+    #                        embed_tokens / lm_head も学習可能なまま維持
+    parser.add_argument(
+        "--freeze_embeddings",
+        type=lambda v: str(v).lower() not in ("false", "0", "no"),
+        default=True,
+        help=(
+            "True(デフォルト)で図(c) Instruction Fine-Tuningの構成"
+            "(embed_tokens/lm_head凍結、Transformer層LoRAのみ学習)。"
+            "Falseで図(b) Continuous Pre-Training相当"
+            "(embed_tokens/lm_headも学習可能)。"
+        ),
+    )
+
     parser.add_argument("--random_seed", type=int, default=3407)
 
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--per_device_train_batch_size", type=int, default=64)
     parser.add_argument("--per_device_eval_batch_size", type=int, default=64)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=2)
-    parser.add_argument("--save_steps", type=int, default=2)
+    # load_best_model_at_end=True の制約上、save_stepsはeval_stepsの整数倍である必要がある
+    # (以前のdefault save_steps=2, eval_steps=50は不整合でTrainer初期化時にValueErrorになっていた)
+    parser.add_argument("--save_steps", type=int, default=50)
     parser.add_argument("--eval_steps", type=int, default=50)
     parser.add_argument("--logging_steps", type=int, default=2)
     parser.add_argument("--max_steps", type=int, default=-1)
@@ -218,8 +267,9 @@ if __name__ == "__main__":
     sys.path.append(args.code_path)
 
     if args.wandb_run_name is None:
+        stage_tag = "instruct-ft" if args.freeze_embeddings else "continual-pt"
         args.wandb_run_name = (
-            f"finetune-mamba-370m"
+            f"finetune-mamba-370m-{stage_tag}"
             f"-bs{args.per_device_train_batch_size}"
             f"-ga{args.gradient_accumulation_steps}"
         )
@@ -301,6 +351,24 @@ if __name__ == "__main__":
         args.model_path,
         is_trainable=True,
     )
+
+    print("\n=== Embedding trainability: adapterロード直後(ステージ設定適用前) ===")
+    inspect_embedding_trainability(model)
+
+    if args.freeze_embeddings:
+        print(
+            "\n--freeze_embeddings=True: "
+            "図(c) Instruction Fine-Tuning として embed_tokens / lm_head を凍結します。"
+        )
+        freeze_pretraining_only_modules(model)
+    else:
+        print(
+            "\n--freeze_embeddings=False: "
+            "図(b) Continuous Pre-Training相当として "
+            "embed_tokens / lm_head を学習可能なまま維持します。"
+        )
+
+    print("\n=== Embedding trainability: ステージ設定適用後 ===")
     inspect_embedding_trainability(model)
     model.config.use_cache = False
 
@@ -480,6 +548,11 @@ if __name__ == "__main__":
         "Unchanged ratio, L2 < 1e-4:",
         (l2_change < 1e-4).float().mean().item(),
     )
+    if args.freeze_embeddings:
+        print(
+            "(freeze_embeddings=True のため、上記のUnchanged ratioは"
+            "ほぼ1.0になるはずです。embed_tokensが学習中に更新されていないことの確認用)"
+        )
 
     # title Show final memory and time stats
     used_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
@@ -501,4 +574,3 @@ if __name__ == "__main__":
     tokenizer.save_pretrained(args.output_path)
 
     print("Save completed.")
-

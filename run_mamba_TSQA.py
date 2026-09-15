@@ -146,9 +146,10 @@ def load_eval_model(config):
     if model_type == "fixed":
         return FixedChoiceModel(choice=config.get("choice", "(a)"))
 
-    if model_type == "chattime":
+    if model_type == "llama":
         return ChatTime(
-            model_path=config["model_path"],
+            base_model_path=config["base_model_path"],
+            adapter_path=config.get("adapter_path", None),
             max_pred_len=config.get("max_pred_len", 16),
             num_samples=config.get("num_samples", 8),
             top_k=config.get("top_k", 100),
@@ -331,18 +332,29 @@ def build_model_configs(args):
             "choice": "(a)",
         })
 
-    if args.include_chattime:
+    if args.include_llama:
         configs.append({
-            "name": "chattime_7b",
-            "type": "chattime",
-            "model_path": args.chattime_model_path,
+            "name": "llama",
+            "type": "llama",
+            "model_path": args.llama_model_path,
             "num_samples": args.num_samples,
             "max_pred_len": args.max_pred_len,
             "top_k": args.top_k,
             "top_p": args.top_p,
             "temperature": args.temperature,
         })
-
+    if args.llama_finetune_adapter is not None:
+        configs.append({
+            "name": "llama_finetuned",
+            "type": "llama",
+            "base_model_path": args.llama_model_path,
+            "adapter_path": args.llama_finetune_adapter,
+            "num_samples": args.num_samples,
+            "max_pred_len": args.max_pred_len,
+            "top_k": args.top_k,
+            "top_p": args.top_p,
+            "temperature": args.temperature,
+        })
     if args.include_mamba_base:
         configs.append({
             "name": "mamba_base",
@@ -442,12 +454,13 @@ def main():
     parser.add_argument("--include_random", action="store_true")
     parser.add_argument("--include_fixed_a", action="store_true")
 
-    parser.add_argument("--include_chattime", action="store_true")
+    parser.add_argument("--include_llama", action="store_true")
     parser.add_argument(
-        "--chattime_model_path",
+        "--llama_model_path",
         type=str,
         default="ChengsenWang/ChatTime-1-7B-Chat",
     )
+    parser.add_argument("--llama_finetune_adapter", type=str, default=None)
 
     parser.add_argument("--include_mamba_base", action="store_true")
     parser.add_argument(

@@ -1,0 +1,93 @@
+FROM pytorch/pytorch:2.3.0-cuda12.1-cudnn8-devel
+# 【メモ】 ベースイメージはDockerfile.mambaと同じものを流用。
+# FalconMambaは通常のMamba(SSM)ブロック+追加RMSNormという構成で、
+# torch/CUDAのバージョンを変える理由は特にないため据え置き。
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+
+ENV HF_HOME=/workspace/.cache/huggingface
+ENV TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
+ENV WANDB_DIR=/workspace/.cache/wandb
+
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=${CUDA_HOME}/bin:${PATH}
+ENV LD_LIBRARY_PATH=/opt/conda/lib/python3.10/site-packages/torch/lib:${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
+
+ENV MAX_JOBS=4
+
+WORKDIR /workspace
+
+RUN apt-get update && apt-get install -y \
+    git \
+    wget \
+    curl \
+    build-essential \
+    ninja-build \
+    libglib2.0-0 \
+    libgl1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --upgrade pip setuptools wheel packaging ninja
+
+RUN python -c "import torch; print('torch:', torch.__version__); print('cuda:', torch.version.cuda)"
+
+# 【変更前】(Dockerfile.mamba)
+# transformers==4.40.2 / trl==0.8.6 / peft==0.11.1 / accelerate==0.30.1 / huggingface_hub==0.23.2
+# → transformers 4.40.2はFalconMambaを認識できない(model_type "falcon_mamba"がv4.45.0で追加)。
+#
+# 【変更後】
+# FalconMamba対応版のtransformersと、それに合わせて動作確認が取れている
+# trl/peft/accelerate/huggingface_hubの組み合わせにアップグレード。
+# あわせてSFTTrainerの呼び出し側(pretrain_falcon_mamba.py)も新API
+# (processing_class= / SFTConfig)に書き換え済み。
+RUN pip install --no-cache-dir \
+    numpy==1.26.4 \
+    pandas==2.2.2 \
+    scikit-learn==1.4.2 \
+    scipy==1.13.1 \
+    tqdm==4.66.4 \
+    matplotlib==3.8.4 \
+    einops==0.8.0 \
+    wandb==0.17.0 \
+    wfdb \
+    rich==13.7.1 \
+    transformers==4.47.0 \
+    datasets==3.0.2 \
+    huggingface_hub==0.26.1 \
+    accelerate==1.1.1 \
+    peft==0.13.2 \
+    trl==0.12.0 \
+    safetensors==0.4.3 \
+    sentencepiece==0.2.0 \
+    protobuf==4.25.3 \
+    bitsandbytes==0.44.1
+
+# 重要: 最新版を入れない
+# FalconMambaは通常のMamba(v1)ブロック相当のCUDAカーネルを使うため、
+# mamba-2.8b-hf用に検証済みのこのバージョンをまず流用する。
+# ただし transformers側でFalconMamba対応時にMambaカーネル呼び出し部分へ
+# 修正が入っている(v4.45.0のリリースノートに"Fix FalconMamba training
+# issues due to incompatible kernels"との記載あり)ため、下の動作確認だけでなく
+# 実際に数ステップ学習を回してエラーが出ないか必ず確認すること。
+RUN pip uninstall -y causal-conv1d mamba-ssm || true
+
+RUN pip install --no-cache-dir --no-build-isolation --no-deps \
+    "causal-conv1d==1.2.2.post1"
+
+RUN pip install --no-cache-dir --no-build-isolation --no-deps \
+    "mamba-ssm==2.0.4"
+
+RUN python -c "import torch; import transformers; import trl; import peft; print('basic import OK')"
+RUN python -c "import causal_conv1d; print('causal_conv1d OK')"
+RUN python -c "import mamba_ssm; print('mamba_ssm OK')"
+
+# FalconMambaクラスが認識されるか(=transformersのバージョンが十分新しいか)のチェック
+RUN python -c "from transformers import FalconMambaForCausalLM; print('FalconMamba class OK')"
+
+# 新しいtrl API(processing_class / SFTConfig)が使えるかのチェック
+RUN python -c "from trl import SFTTrainer, SFTConfig; print('trl new API OK')"
+
+COPY . /workspace
+
+CMD ["/bin/bash"]
