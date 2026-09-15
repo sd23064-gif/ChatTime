@@ -1,13 +1,12 @@
 accelerate==1.8.1
 datasets==3.6.0
+fsspec[http]==2025.3.0
+xformers==0.0.31
 huggingface-hub==0.34.0
+
 numpy==2.1.2
 pandas==2.3.0
 scikit-learn==1.7.0
-
-torch==2.7.1+cu118
-torchvision==0.22.1+cu118
-torchaudio==2.7.1+cu118
 
 transformers==4.56.1
 peft==0.18.0
